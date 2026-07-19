@@ -181,4 +181,4 @@ npm run build
 
 ## License 📄
 
-MIT © [mryos](https://github.com/mryos)
+MIT © [TitleKungz-01](https://github.com/TitleKung-01)

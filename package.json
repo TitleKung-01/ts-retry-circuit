@@ -1,7 +1,28 @@
 {
   "name": "ts-retry-circuit",
-  "version": "1.0.1",
+  "version": "1.0.3",
+  "license": "MIT",
   "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js and Next.js",
+  "author": "TitleKung-01",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TitleKung-01/ts-retry-circuit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TitleKung-01/ts-retry-circuit/issues"
+  },
+  "homepage": "https://github.com/TitleKung-01/ts-retry-circuit#readme",
+  "keywords": [
+    "circuit-breaker",
+    "retry",
+    "backoff",
+    "jitter",
+    "react",
+    "typescript",
+    "nextjs",
+    "isomorphic",
+    "resilience"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
