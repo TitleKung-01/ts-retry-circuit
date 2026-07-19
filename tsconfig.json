@@ -10,6 +10,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "outDir": "./dist",
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*"]
 }

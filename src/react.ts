@@ -85,20 +85,18 @@ export function useCircuitBreaker(
       activeRequests: currentStatus.activeRequests,
     });
 
-    // สมัครรับข้อมูลการเปลี่ยนแปลงสเตตัส
-    breaker.onStateChange = (newState, details) => {
+    // สมัครรับข้อมูลการเปลี่ยนแปลงสเตตัส (รองรับระบบ Pub/Sub สำหรับ Shared Instances)
+    const unsubscribe = breaker.subscribe((newState, details) => {
       setCircuitState(newState);
       setMetrics({
         failureCount: details.failureCount,
         activeRequests: breaker.getStatus().activeRequests,
       });
-    };
+    });
 
     // คืนค่าฟังก์ชันเพื่อเคลียร์ Listener ป้องกัน Memory Leak
     return () => {
-      if (breaker) {
-        breaker.onStateChange = undefined;
-      }
+      unsubscribe();
     };
   }, [instanceKey]);
 
@@ -112,25 +110,7 @@ export function useCircuitBreaker(
         "[useCircuitBreaker] CircuitBreaker instance is not initialized.",
       );
     }
-
-    try {
-      // สั่งอัปเดตสถานะ Active Requests ก่อนรัน
-      setMetrics((prev) => ({
-        ...prev,
-        activeRequests: breaker.getStatus().activeRequests + 1,
-      }));
-
-      const result = await breaker.execute(fn);
-      return result;
-    } finally {
-      // เมื่อรันเสร็จ (ไม่ว่าจะสำเร็จหรือพัง) ให้ดึงสถานะขีดสุดมาอัปเดตหน้า UI อีกรอบ
-      const status = breaker.getStatus();
-      setCircuitState(status.state);
-      setMetrics({
-        failureCount: status.failureCount,
-        activeRequests: status.activeRequests,
-      });
-    }
+    return breaker.execute(fn);
   }, []);
 
   return {

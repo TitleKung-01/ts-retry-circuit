@@ -63,4 +63,47 @@ describe("useCircuitBreaker", () => {
     expect(result.current.state).toBe("OPEN");
     expect(result.current.isOpened).toBe(true);
   });
+
+  it("should share state and trigger updates across multiple hooks sharing the same instanceKey", async () => {
+    const { result: hook1 } = renderHook(() =>
+      useCircuitBreaker({
+        failureThreshold: 2,
+        cooldownPeriod: 1000,
+        maxRetries: 0,
+        instanceKey: "shared-key",
+      }),
+    );
+
+    const { result: hook2 } = renderHook(() =>
+      useCircuitBreaker({
+        failureThreshold: 2,
+        cooldownPeriod: 1000,
+        maxRetries: 0,
+        instanceKey: "shared-key",
+      }),
+    );
+
+    expect(hook1.current.state).toBe("CLOSED");
+    expect(hook2.current.state).toBe("CLOSED");
+
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+
+    // First failure triggered by hook1
+    await act(async () => {
+      await expect(hook1.current.execute(fn)).rejects.toThrow("fail");
+    });
+
+    expect(hook1.current.failureCount).toBe(1);
+    expect(hook2.current.failureCount).toBe(1);
+
+    // Second failure triggered by hook2
+    await act(async () => {
+      await expect(hook2.current.execute(fn)).rejects.toThrow("fail");
+    });
+
+    expect(hook1.current.state).toBe("OPEN");
+    expect(hook2.current.state).toBe("OPEN");
+    expect(hook1.current.isOpened).toBe(true);
+    expect(hook2.current.isOpened).toBe(true);
+  });
 });

@@ -1,6 +1,6 @@
 {
   "name": "ts-retry-circuit",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js and Next.js",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

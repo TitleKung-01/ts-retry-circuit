@@ -34,11 +34,24 @@ export class CircuitBreaker {
   private readonly initialRetryDelay: number;
   private readonly isExpectedError?: (error: unknown) => boolean;
 
-  // สำหรับให้ Dev ฝั่ง Frontend หรือ Logging ผูก Listener ดูสถานะระบบได้
+  private readonly listeners = new Set<
+    (state: CircuitState, details: { failureCount: number }) => void
+  >();
+
+  // สำหรับให้ Dev ฝั่ง Frontend หรือ Logging ผูก Listener ดูสถานะระบบได้ (Backward Compatibility)
   public onStateChange?: (
     state: CircuitState,
     details: { failureCount: number },
   ) => void;
+
+  public subscribe(
+    listener: (state: CircuitState, details: { failureCount: number }) => void,
+  ): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   constructor(config: CircuitConfig) {
     if (config.failureThreshold <= 0)
@@ -76,6 +89,7 @@ export class CircuitBreaker {
     }
 
     this.activeRequests++;
+    this.emitStateChange();
     let attempt = 0;
 
     try {
@@ -110,6 +124,7 @@ export class CircuitBreaker {
       }
     } finally {
       this.activeRequests--;
+      this.emitStateChange();
     }
   }
 
@@ -125,10 +140,11 @@ export class CircuitBreaker {
 
   private onSuccess() {
     const previousState = this.state;
+    const previousFailureCount = this.failureCount;
     this.failureCount = 0;
     this.state = "CLOSED";
 
-    if (previousState !== "CLOSED") {
+    if (previousState !== "CLOSED" || previousFailureCount > 0) {
       this.emitStateChange();
     }
   }
@@ -142,6 +158,8 @@ export class CircuitBreaker {
       this.failureCount >= this.failureThreshold
     ) {
       this.changeState("OPEN", Date.now() + this.cooldownPeriod);
+    } else {
+      this.emitStateChange();
     }
   }
 
@@ -160,6 +178,9 @@ export class CircuitBreaker {
   private emitStateChange() {
     if (this.onStateChange) {
       this.onStateChange(this.state, { failureCount: this.failureCount });
+    }
+    for (const listener of this.listeners) {
+      listener(this.state, { failureCount: this.failureCount });
     }
   }
 
