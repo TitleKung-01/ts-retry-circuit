@@ -1,32 +1,32 @@
-# ts-retry-circuit 🚀
+# ts-retry-circuit
 
 A production-grade, isomorphic, zero-dependency Circuit Breaker and Auto-Retry library with native React support. Designed for Node.js, Next.js, and React applications.
 
 [![NPM Version](https://img.shields.io/npm/v/ts-retry-circuit.svg)](https://www.npmjs.com/package/ts-retry-circuit)
-[![License](https://img.shields.io/npm/l/ts-retry-circuit.svg)](https://github.com/mryos/ts-retry-circuit/blob/main/LICENSE)
+[![License](https://img.shields.io/npm/l/ts-retry-circuit.svg)](https://github.com/TitleKung-01/ts-retry-circuit/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
 [![Vitest](https://img.shields.io/badge/Tested%20with-Vitest-yellow.svg)](https://vitest.dev/)
 
 ---
 
-## Features 🌟
+## Features
 
-- 🛡️ **Isomorphic**: Runs seamlessly in any environment—Node.js, Next.js (SSR & API routes), and React (Client-side).
-- ⚙️ **Auto-Retry with Jitter**: Automatically retries failed operations using Exponential Backoff and Full Jitter to prevent the "Thundering Herd" problem.
-- 🛑 **Concurrency Guard in HALF-OPEN**: Limits execution to exactly one request while testing a recovering system in the `HALF-OPEN` state, immediately throttling any concurrent calls.
-- 🔌 **Native React Hook**: Seamlessly bind circuit state to React components with the `useCircuitBreaker` hook.
-- 🔗 **Shared Circuit State**: Share a single circuit breaker instance across multiple independent components using a unique `instanceKey`.
-- 🎛️ **Error Filtering**: Exclude expected errors (e.g., `401 Unauthorized`, `404 Not Found`, validation errors) so they don't count towards tripping the circuit.
+- **Isomorphic**: Runs in Node.js, Next.js (SSR & API routes), and React (client-side).
+- **Auto-Retry with Jitter**: Exponential backoff + full jitter in the `CLOSED` state.
+- **HALF-OPEN concurrency guard**: Exactly one probe request while recovering.
+- **Timeout & AbortSignal**: Per-attempt timeout and cooperative cancellation.
+- **Fallback**: Degrade gracefully when the circuit rejects or a request finally fails.
+- **Typed errors**: Stable `code` values instead of string-matching messages.
+- **Native React hook**: Bind circuit state to UI; share instances via `instanceKey`.
+- **Error filtering**: Exclude expected errors (e.g. `401`, `404`) from tripping the circuit.
 
 ---
 
-## Installation 📦
+## Installation
 
 ```bash
 npm install ts-retry-circuit
 ```
-
-Or using other package managers:
 
 ```bash
 yarn add ts-retry-circuit
@@ -36,28 +36,51 @@ bun add ts-retry-circuit
 
 ---
 
-## Quick Start 🚀
+## Migrating from v1 to v2
 
-### 1. Core API (Node.js, Next.js, Pure TypeScript)
+Breaking changes:
 
-Create a circuit breaker and wrap your network or database calls:
+1. Rejects when the circuit is open or throttled are typed errors (`CircuitOpenError`, `CircuitHalfOpenThrottledError`), not plain `Error` strings with emoji.
+2. Prefer `instanceof` / `.code` instead of matching `error.message`.
+3. New optional APIs: `timeout`, `fallback`, `halfOpenSuccessThreshold`, `execute(fn, { signal })`, `reset()`, `getMetrics()`.
 
 ```typescript
-import { CircuitBreaker } from "ts-retry-circuit";
+import { CircuitOpenError } from "ts-retry-circuit";
 
-// 1. Initialize the Circuit Breaker configuration
-const breaker = new CircuitBreaker({
-  failureThreshold: 3,       // Trip the circuit to OPEN after 3 consecutive failures
-  cooldownPeriod: 5000,      // Wait 5 seconds before entering HALF-OPEN state to test the system
-  maxRetries: 2,             // Retry up to 2 times for transient errors in CLOSED state
-  initialRetryDelay: 1000,   // Wait 1 second before first retry (using exponential jitter backoff)
-  isExpectedError: (error) => {
-    // Ignore validation or expected business errors from tripping the circuit
-    return error instanceof ValidationError;
+try {
+  await breaker.execute(fn);
+} catch (error) {
+  if (error instanceof CircuitOpenError) {
+    console.log(`Retry after ${error.retryAfterMs}ms`);
   }
+}
+```
+
+---
+
+## Quick Start
+
+### 1. Core API (Node.js, Next.js, TypeScript)
+
+```typescript
+import { CircuitBreaker, CircuitOpenError } from "ts-retry-circuit";
+
+const breaker = new CircuitBreaker({
+  failureThreshold: 3,
+  cooldownPeriod: 5000,
+  maxRetries: 2,
+  initialRetryDelay: 1000,
+  timeout: 3000,
+  halfOpenSuccessThreshold: 1,
+  isExpectedError: (error) => error instanceof ValidationError,
+  fallback: (error, { state }) => {
+    if (error instanceof CircuitOpenError) {
+      return { degraded: true, retryAfterMs: error.retryAfterMs, state };
+    }
+    throw error;
+  },
 });
 
-// 2. Execute your function securely
 async function fetchUserData() {
   return breaker.execute(async () => {
     const response = await fetch("https://api.example.com/user");
@@ -67,27 +90,30 @@ async function fetchUserData() {
 }
 ```
 
-### 2. React Integration (`useCircuitBreaker` Hook)
-
-Use the hook to bind the circuit state directly to your UI elements:
+### 2. React Integration (`useCircuitBreaker`)
 
 ```tsx
 import React from "react";
 import { useCircuitBreaker } from "ts-retry-circuit/react";
 
 function PaymentForm() {
-  const { state, execute, isOpened, activeRequests, failureCount } = useCircuitBreaker({
+  const {
+    state,
+    execute,
+    reset,
+    isOpened,
+    isHalfOpen,
+    activeRequests,
+    failureCount,
+  } = useCircuitBreaker({
     failureThreshold: 2,
-    cooldownPeriod: 10000, // Stay open for 10 seconds on failure
+    cooldownPeriod: 10000,
     maxRetries: 1,
   });
 
   const handleCheckout = async () => {
     try {
-      const receipt = await execute(async () => {
-        return await processPayment();
-      });
-      alert("Payment Successful!");
+      await execute(async () => processPayment());
     } catch (error) {
       console.error("Payment failed:", error);
     }
@@ -97,13 +123,23 @@ function PaymentForm() {
     <div>
       <p>System State: <strong>{state}</strong></p>
       <p>Consecutive Failures: {failureCount}</p>
-      
-      <button 
-        onClick={handleCheckout} 
-        disabled={isOpened || activeRequests > 0}
+
+      <button
+        onClick={handleCheckout}
+        disabled={isOpened || isHalfOpen || activeRequests > 0}
       >
-        {activeRequests > 0 ? "Processing..." : isOpened ? "Service Temporarily Unavailable" : "Pay Now"}
+        {activeRequests > 0
+          ? "Processing..."
+          : isOpened
+            ? "Service Temporarily Unavailable"
+            : "Pay Now"}
       </button>
+
+      {isOpened ? (
+        <button type="button" onClick={reset}>
+          Reset circuit
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -111,74 +147,94 @@ function PaymentForm() {
 
 ### 3. Sharing Circuit State Across Components
 
-You can synchronize the circuit state of multiple components (e.g., payment button and cart status indicators) by providing a unique `instanceKey`. The state changes will automatically sync between them:
+Config is frozen at the first registration for a given `instanceKey`. Later mounts reuse that instance and ignore new config. Call `releaseInstance(key)` for tests or SPA teardown.
 
 ```tsx
-// Both hooks share the same underlying instance and will transition states in sync
+import { useCircuitBreaker, releaseInstance } from "ts-retry-circuit/react";
+
 const paymentBreaker = useCircuitBreaker({
   instanceKey: "stripe-gateway-circuit",
   failureThreshold: 3,
   cooldownPeriod: 5000,
 });
+
+// later / in tests
+releaseInstance("stripe-gateway-circuit");
 ```
 
 ---
 
-## API Reference 📖
+## Comparison
 
-### 1. `CircuitConfig` Options
+| Capability | ts-retry-circuit | opossum | cockatiel |
+| :--- | :--- | :--- | :--- |
+| Circuit + consecutive failures | Yes | Rolling % window | Consecutive or sampling |
+| Built-in retry + full jitter | Yes (`CLOSED` only) | Limited | Separate policy |
+| Native React hook + shared `instanceKey` | Yes | No | No |
+| Timeout / AbortSignal | Yes | Yes | Yes |
+| Fallback | Yes | Yes | Yes |
+| Typed reject reasons | Yes | Events mostly | Error codes |
+| Bulkhead / policy compose / Prometheus | No (out of scope) | Partial / plugin | Yes / no native prom |
+
+---
+
+## API Reference
+
+### `CircuitConfig`
 
 | Property | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `failureThreshold` | `number` | **Required** | The number of consecutive errors needed to transition the state to `OPEN`. |
-| `cooldownPeriod` | `number` | **Required** | The duration (in milliseconds) the circuit stays `OPEN` before trying to recover in `HALF-OPEN` state. |
-| `maxRetries` | `number` | `3` | Maximum retry attempts for failed requests while in the `CLOSED` state. |
-| `initialRetryDelay` | `number` | `500` | Initial delay (in milliseconds) for the exponential backoff calculation. |
-| `isExpectedError` | `(err: unknown) => boolean` | `undefined` | A filter function. Errors returning `true` won't increment the failure counter. |
+| `failureThreshold` | `number` | **Required** | Consecutive failures to open the circuit. |
+| `cooldownPeriod` | `number` | **Required** | Ms to stay `OPEN` before `HALF-OPEN`. |
+| `maxRetries` | `number` | `3` | Retries while `CLOSED`. |
+| `initialRetryDelay` | `number` | `500` | Initial backoff delay (ms). |
+| `timeout` | `number` | `undefined` | Per-attempt timeout (ms). |
+| `halfOpenSuccessThreshold` | `number` | `1` | Successes in `HALF-OPEN` before `CLOSED`. |
+| `isExpectedError` | `(err) => boolean` | `undefined` | Errors that do not count as failures. |
+| `fallback` | `(err, ctx) => unknown` | `undefined` | Used on OPEN/throttle/final failure (not expected errors). |
 
----
+### `CircuitBreaker`
 
-### 2. `CircuitBreaker` Class
+- `execute<T>(fn, options?: { signal?: AbortSignal }): Promise<T>`
+- `getStatus(): CircuitStatus`
+- `getMetrics(): CircuitMetrics`
+- `reset(): void`
+- `subscribe(listener): () => void`
 
-#### Methods:
-- `execute<T>(fn: () => Promise<T>): Promise<T>`: Wraps and executes your asynchronous function under the circuit breaker & retry rules.
-- `getStatus(): CircuitStatus`: Returns current metrics and state (`state`, `failureCount`, `nextAttemptTime`, `activeRequests`).
-- `subscribe(listener): () => void`: Subscribes to state change events. Returns an unsubscribe function.
+### Typed errors
 
----
+| Class | `code` | When |
+| :--- | :--- | :--- |
+| `CircuitOpenError` | `CIRCUIT_OPEN` | Circuit is `OPEN` (`retryAfterMs` included) |
+| `CircuitHalfOpenThrottledError` | `CIRCUIT_HALF_OPEN_THROTTLED` | Extra probe while `HALF-OPEN` |
+| `CircuitTimeoutError` | `CIRCUIT_TIMEOUT` | Attempt exceeded `timeout` |
+| `CircuitAbortedError` | `CIRCUIT_ABORTED` | `AbortSignal` aborted |
 
-### 3. `useCircuitBreaker` Hook Result
+### `useCircuitBreaker` result
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
-| `state` | `CircuitState` | Current state: `'CLOSED' \| 'OPEN' \| 'HALF-OPEN'`. |
-| `failureCount` | `number` | Total consecutive failures accumulated in the current cycle. |
-| `activeRequests` | `number` | Number of concurrent requests actively running through this hook instance. |
-| `execute` | `<T>(fn: () => Promise<T>) => Promise<T>` | Wraps the given async function execution in the circuit breaker rules. |
-| `isOpened` | `boolean` | Helper flag that is `true` if the circuit is `OPEN` (useful for disabling UI action buttons). |
+| `state` | `CircuitState` | `'CLOSED' \| 'OPEN' \| 'HALF-OPEN'` |
+| `failureCount` | `number` | Consecutive failures in the current cycle |
+| `activeRequests` | `number` | In-flight requests through this breaker |
+| `execute` | `(fn, options?) => Promise<T>` | Run work through the breaker |
+| `reset` | `() => void` | Force `CLOSED` and clear counters |
+| `isOpened` | `boolean` | `state === 'OPEN'` |
+| `isHalfOpen` | `boolean` | `state === 'HALF-OPEN'` |
 
 ---
 
-## Development & Testing 🛠️
-
-Feel free to fork, open issues, or submit PRs!
+## Development & Testing
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Run lint, formatting check, type checking, and unit tests
 npm run validate
-
-# 3. Run unit tests directly (powered by Vitest)
 npm run test:run
-
-# 4. Build package bundles (CJS & ESM formats)
 npm run build
 ```
 
 ---
 
-## License 📄
+## License
 
-MIT © [TitleKungz-01](https://github.com/TitleKung-01)
+MIT © [TitleKung-01](https://github.com/TitleKung-01)

@@ -1,6 +1,6 @@
 {
   "name": "ts-retry-circuit",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "license": "MIT",
   "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js and Next.js",
   "author": "TitleKung-01",
@@ -23,20 +23,20 @@
     "isomorphic",
     "resilience"
   ],
-  "main": "./dist/index.js",
-  "module": "./dist/index.mjs",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     },
     "./react": {
       "types": "./dist/react.d.ts",
-      "import": "./dist/react.mjs",
-      "require": "./dist/react.js"
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
     }
   },
   "files": [

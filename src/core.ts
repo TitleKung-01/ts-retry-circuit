@@ -1,18 +1,41 @@
 // src/core.ts
 
+import {
+  CircuitAbortedError,
+  CircuitHalfOpenThrottledError,
+  CircuitOpenError,
+  CircuitTimeoutError,
+} from "./errors.js";
+
 export type CircuitState = "CLOSED" | "OPEN" | "HALF-OPEN";
 
+export interface CircuitFallbackContext {
+  state: CircuitState;
+}
+
 export interface CircuitConfig {
-  /** พังติดต่อกันกี่ครั้งถึงจะสั่งตัดวงจร (สับคัตเอาท์เป็น OPEN) */
+  /** Consecutive failures required to transition to OPEN */
   failureThreshold: number;
-  /** เวลาที่ต้องรอ (มิลลิวินาที) ก่อนที่จะลองเปิดใจใหม่อีกครั้งในสถานะ HALF-OPEN */
+  /** Milliseconds to stay OPEN before entering HALF-OPEN */
   cooldownPeriod: number;
-  /** จำนวนครั้งสูงสุดที่จะพยายามลองยิงซ้ำ (Retry) ใหม่ก่อนจะยอมแพ้ */
+  /** Max retries while CLOSED (default: 3) */
   maxRetries?: number;
-  /** เวลาเริ่มต้นในการหน่วงเพื่อรอ Retry ใหม่ (มิลลิวินาที) */
+  /** Initial delay in ms for exponential full-jitter backoff (default: 500) */
   initialRetryDelay?: number;
-  /** ฟังก์ชันกรอง Error: ตัวแปรไหนเจอแล้วไม่ต้องนับเป็นความพังของระบบ (เช่น 401 Unauthorized, 404 Not Found) */
+  /** Errors returning true are rethrown without counting as circuit failures */
   isExpectedError?: (error: unknown) => boolean;
+  /** Per-attempt timeout in ms; timed-out attempts count as failures */
+  timeout?: number;
+  /**
+   * Invoked when the circuit rejects (OPEN / HALF-OPEN throttle) or after
+   * final counted failure. Not used for expected errors.
+   */
+  fallback?: (
+    error: unknown,
+    context: CircuitFallbackContext,
+  ) => unknown | Promise<unknown>;
+  /** Successes required in HALF-OPEN before returning to CLOSED (default: 1) */
+  halfOpenSuccessThreshold?: number;
 }
 
 export interface CircuitStatus {
@@ -22,23 +45,40 @@ export interface CircuitStatus {
   activeRequests: number;
 }
 
+export interface CircuitMetrics extends CircuitStatus {
+  successCount: number;
+  halfOpenSuccessCount: number;
+  openedCount: number;
+  rejectedCount: number;
+}
+
+export interface ExecuteOptions {
+  signal?: AbortSignal;
+}
+
 export class CircuitBreaker {
   private state: CircuitState = "CLOSED";
   private failureCount: number = 0;
+  private halfOpenSuccessCount: number = 0;
   private nextAttemptTime: number = 0;
-  private activeRequests: number = 0; // Concurrency Counter ดักจับ Race Condition
+  private activeRequests: number = 0;
+  private successCount: number = 0;
+  private openedCount: number = 0;
+  private rejectedCount: number = 0;
 
   private readonly failureThreshold: number;
   private readonly cooldownPeriod: number;
   private readonly maxRetries: number;
   private readonly initialRetryDelay: number;
   private readonly isExpectedError?: (error: unknown) => boolean;
+  private readonly timeout?: number;
+  private readonly fallback?: CircuitConfig["fallback"];
+  private readonly halfOpenSuccessThreshold: number;
 
   private readonly listeners = new Set<
     (state: CircuitState, details: { failureCount: number }) => void
   >();
 
-  // สำหรับให้ Dev ฝั่ง Frontend หรือ Logging ผูก Listener ดูสถานะระบบได้ (Backward Compatibility)
   public onStateChange?: (
     state: CircuitState,
     details: { failureCount: number },
@@ -58,34 +98,42 @@ export class CircuitBreaker {
       throw new Error("failureThreshold must be greater than 0");
     if (config.cooldownPeriod <= 0)
       throw new Error("cooldownPeriod must be greater than 0");
+    if (config.timeout !== undefined && config.timeout <= 0)
+      throw new Error("timeout must be greater than 0");
+    if (
+      config.halfOpenSuccessThreshold !== undefined &&
+      config.halfOpenSuccessThreshold <= 0
+    )
+      throw new Error("halfOpenSuccessThreshold must be greater than 0");
 
     this.failureThreshold = config.failureThreshold;
     this.cooldownPeriod = config.cooldownPeriod;
     this.maxRetries = config.maxRetries ?? 3;
     this.initialRetryDelay = config.initialRetryDelay ?? 500;
     this.isExpectedError = config.isExpectedError;
+    this.timeout = config.timeout;
+    this.fallback = config.fallback;
+    this.halfOpenSuccessThreshold = config.halfOpenSuccessThreshold ?? 1;
   }
 
-  /**
-   * 🚀 ฟังก์ชันหลักที่ครอบระบบความปลอดภัยและการจัดการ Request ทั่วทั้งระบบ
-   */
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
+  async execute<T>(fn: () => Promise<T>, options?: ExecuteOptions): Promise<T> {
+    const signal = options?.signal;
+    this.throwIfAborted(signal);
     this.updateState();
 
-    // 1. ตรวจสอบสภาพวงจร (Circuit Breaker Guard)
     if (this.state === "OPEN") {
       const remainingTime = Math.max(0, this.nextAttemptTime - Date.now());
-      throw new Error(
-        `🚨 [CircuitBreaker] Circuit is OPEN. Request blocked. Retry available in ${remainingTime}ms.`,
-      );
+      const error = new CircuitOpenError(remainingTime);
+      this.rejectedCount++;
+      this.emitStateChange();
+      return this.applyFallbackOrThrow<T>(error);
     }
 
-    // 2. ป้องกันข้ามสถานะขณะทดสอบระบบ (HALF-OPEN Concurrency Guard)
-    // หากอยู่ในสถานะ HALF-OPEN ยอมให้หลุดเข้าไปทดสอบได้ทีละ 1 Request เท่านั้น ตัวที่มาทีหลังให้เด้งออกไปก่อน
     if (this.state === "HALF-OPEN" && this.activeRequests > 0) {
-      throw new Error(
-        `⏳ [CircuitBreaker] Circuit is HALF-OPEN and testing. Request throttled.`,
-      );
+      const error = new CircuitHalfOpenThrottledError();
+      this.rejectedCount++;
+      this.emitStateChange();
+      return this.applyFallbackOrThrow<T>(error);
     }
 
     this.activeRequests++;
@@ -94,32 +142,32 @@ export class CircuitBreaker {
 
     try {
       while (true) {
+        this.throwIfAborted(signal);
         try {
-          const result = await fn();
+          const result = await this.runAttempt(fn, signal);
           this.onSuccess();
           return result;
         } catch (error) {
-          // ตรวจสอบว่าเป็น Error ที่คาดเดาได้อยู่แล้วหรือไม่ (เช่น User พิมพ์รหัสผ่านผิด ไม่นับว่า Server พัง)
+          if (error instanceof CircuitAbortedError) {
+            throw error;
+          }
+
           if (this.isExpectedError && this.isExpectedError(error)) {
             throw error;
           }
 
           attempt++;
 
-          // กลไกการทำ Retry จะเกิดขึ้นเฉพาะตอนสถานะ CLOSED เท่านั้น (HALF-OPEN ห้ามทำ Retry)
           if (attempt <= this.maxRetries && this.state === "CLOSED") {
-            // สูตร Exponential Backoff + Full Jitter เพื่อกระจายโหลดไม่ให้ยิงพร้อมกันชุลมุน
             const backoffLimit =
               this.initialRetryDelay * Math.pow(2, attempt - 1);
             const jitteredDelay = Math.random() * backoffLimit;
-
-            await this.sleep(jitteredDelay);
+            await this.sleep(jitteredDelay, signal);
             continue;
           }
 
-          // พยายามจนหมด หรือพังในสภาวะทดสอบระบบ ส่งไปสับคัตเอาท์ลง
           this.onFailure();
-          throw error;
+          return this.applyFallbackOrThrow<T>(error);
         }
       }
     } finally {
@@ -138,10 +186,149 @@ export class CircuitBreaker {
     };
   }
 
+  public getMetrics(): CircuitMetrics {
+    this.updateState();
+    return {
+      ...this.getStatus(),
+      successCount: this.successCount,
+      halfOpenSuccessCount: this.halfOpenSuccessCount,
+      openedCount: this.openedCount,
+      rejectedCount: this.rejectedCount,
+    };
+  }
+
+  public reset(): void {
+    const previousState = this.state;
+    const previousFailureCount = this.failureCount;
+    const previousHalfOpenSuccessCount = this.halfOpenSuccessCount;
+
+    this.state = "CLOSED";
+    this.failureCount = 0;
+    this.halfOpenSuccessCount = 0;
+    this.nextAttemptTime = 0;
+
+    if (
+      previousState !== "CLOSED" ||
+      previousFailureCount > 0 ||
+      previousHalfOpenSuccessCount > 0
+    ) {
+      this.emitStateChange();
+    }
+  }
+
+  private async applyFallbackOrThrow<T>(error: unknown): Promise<T> {
+    if (this.fallback) {
+      return (await this.fallback(error, { state: this.state })) as T;
+    }
+    throw error;
+  }
+
+  private async runAttempt<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    this.throwIfAborted(signal);
+
+    if (this.timeout === undefined) {
+      return this.raceWithAbort(fn(), signal);
+    }
+
+    const timeoutMs = this.timeout;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+          cleanup();
+          reject(new CircuitAbortedError());
+        };
+
+        const cleanup = () => {
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          signal?.removeEventListener("abort", onAbort);
+        };
+
+        timeoutId = setTimeout(() => {
+          cleanup();
+          reject(new CircuitTimeoutError(timeoutMs));
+        }, timeoutMs);
+
+        if (signal) {
+          if (signal.aborted) {
+            cleanup();
+            reject(new CircuitAbortedError());
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+
+        fn()
+          .then((value) => {
+            cleanup();
+            resolve(value);
+          })
+          .catch((err: unknown) => {
+            cleanup();
+            reject(err);
+          });
+      });
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
+  }
+
+  private raceWithAbort<T>(
+    promise: Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!signal) return promise;
+
+    return new Promise<T>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new CircuitAbortedError());
+        return;
+      }
+
+      const onAbort = () => {
+        signal.removeEventListener("abort", onAbort);
+        reject(new CircuitAbortedError());
+      };
+
+      signal.addEventListener("abort", onAbort, { once: true });
+
+      promise
+        .then((value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        })
+        .catch((err: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(err);
+        });
+    });
+  }
+
   private onSuccess() {
     const previousState = this.state;
     const previousFailureCount = this.failureCount;
+    this.successCount++;
+
+    if (this.state === "HALF-OPEN") {
+      this.halfOpenSuccessCount++;
+      this.failureCount = 0;
+
+      if (this.halfOpenSuccessCount >= this.halfOpenSuccessThreshold) {
+        this.halfOpenSuccessCount = 0;
+        this.state = "CLOSED";
+        this.emitStateChange();
+      } else {
+        this.emitStateChange();
+      }
+      return;
+    }
+
     this.failureCount = 0;
+    this.halfOpenSuccessCount = 0;
     this.state = "CLOSED";
 
     if (previousState !== "CLOSED" || previousFailureCount > 0) {
@@ -151,12 +338,13 @@ export class CircuitBreaker {
 
   private onFailure() {
     this.failureCount++;
+    this.halfOpenSuccessCount = 0;
 
-    // ถ้าระบบพังตอนกำลังทดสอบ (HALF-OPEN) ให้สั่งปิดตายระบบทันที ไม่ต้องรอสะสมแต้มพัง
     if (
       this.state === "HALF-OPEN" ||
       this.failureCount >= this.failureThreshold
     ) {
+      this.openedCount++;
       this.changeState("OPEN", Date.now() + this.cooldownPeriod);
     } else {
       this.emitStateChange();
@@ -165,6 +353,7 @@ export class CircuitBreaker {
 
   private updateState() {
     if (this.state === "OPEN" && Date.now() > this.nextAttemptTime) {
+      this.halfOpenSuccessCount = 0;
       this.changeState("HALF-OPEN", 0);
     }
   }
@@ -184,7 +373,39 @@ export class CircuitBreaker {
     }
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new CircuitAbortedError();
+    }
+  }
+
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new CircuitAbortedError());
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+
+      const onAbort = () => {
+        clearTimeout(timeoutId);
+        signal?.removeEventListener("abort", onAbort);
+        reject(new CircuitAbortedError());
+      };
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }
+
+export {
+  CircuitAbortedError,
+  CircuitHalfOpenThrottledError,
+  CircuitOpenError,
+  CircuitTimeoutError,
+  isCircuitError,
+} from "./errors.js";
