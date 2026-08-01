@@ -2,7 +2,8 @@ export type CircuitErrorCode =
   | "CIRCUIT_OPEN"
   | "CIRCUIT_HALF_OPEN_THROTTLED"
   | "CIRCUIT_TIMEOUT"
-  | "CIRCUIT_ABORTED";
+  | "CIRCUIT_ABORTED"
+  | "CIRCUIT_CAPACITY_REJECTED";
 
 export class CircuitOpenError extends Error {
   readonly code = "CIRCUIT_OPEN" as const;
@@ -48,17 +49,32 @@ export class CircuitAbortedError extends Error {
   }
 }
 
+export class CircuitCapacityRejectedError extends Error {
+  readonly code = "CIRCUIT_CAPACITY_REJECTED" as const;
+  readonly capacity: number;
+
+  constructor(capacity: number) {
+    super(
+      `[CircuitBreaker] Capacity limit of ${capacity} concurrent executions reached.`,
+    );
+    this.name = "CircuitCapacityRejectedError";
+    this.capacity = capacity;
+  }
+}
+
 export function isCircuitError(
   error: unknown,
 ): error is
   | CircuitOpenError
   | CircuitHalfOpenThrottledError
   | CircuitTimeoutError
-  | CircuitAbortedError {
+  | CircuitAbortedError
+  | CircuitCapacityRejectedError {
   return (
     error instanceof CircuitOpenError ||
     error instanceof CircuitHalfOpenThrottledError ||
     error instanceof CircuitTimeoutError ||
-    error instanceof CircuitAbortedError
+    error instanceof CircuitAbortedError ||
+    error instanceof CircuitCapacityRejectedError
   );
 }

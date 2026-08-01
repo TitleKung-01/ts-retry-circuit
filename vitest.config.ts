@@ -2,8 +2,6 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // We define separate projects for the Core logic and React components
-    // to cleanly isolate the environment requirements for each.
     projects: [
       {
         test: {
@@ -20,7 +18,20 @@ export default defineConfig({
         },
       },
     ],
-    // Global options can be specified here
     globals: false,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "lcov"],
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.bench.ts"],
+      thresholds: {
+        "src/core.ts": {
+          statements: 90,
+          branches: 80,
+          functions: 90,
+          lines: 90,
+        },
+      },
+    },
   },
 });

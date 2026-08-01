@@ -1,12 +1,18 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { createElement, type ReactNode } from "react";
 import { renderHook, act } from "@testing-library/react";
-import { useCircuitBreaker, releaseInstance } from "../react.js";
+import {
+  useCircuitBreaker,
+  releaseInstance,
+  CircuitProvider,
+} from "../react.js";
 
 describe("useCircuitBreaker", () => {
   afterEach(() => {
     releaseInstance("shared-key");
     releaseInstance("release-key");
     releaseInstance("reuse-key");
+    releaseInstance("provider-key");
   });
 
   it("should initialize hook with correct default values", () => {
@@ -22,6 +28,7 @@ describe("useCircuitBreaker", () => {
     expect(result.current.activeRequests).toBe(0);
     expect(result.current.isOpened).toBe(false);
     expect(result.current.isHalfOpen).toBe(false);
+    expect(result.current.metrics.successCount).toBe(0);
   });
 
   it("should successfully execute a promise-returning function", async () => {
@@ -187,5 +194,34 @@ describe("useCircuitBreaker", () => {
     expect(second.result.current.isOpened).toBe(true);
     expect(second.result.current.state).toBe("OPEN");
     second.unmount();
+  });
+
+  it("should scope shared keys via CircuitProvider", async () => {
+    const registry = new Map();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(CircuitProvider, { registry, children });
+
+    const { result } = renderHook(
+      () =>
+        useCircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          maxRetries: 0,
+          instanceKey: "provider-key",
+        }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await expect(
+        result.current.execute(async () => {
+          throw new Error("fail");
+        }),
+      ).rejects.toThrow("fail");
+    });
+
+    expect(result.current.isOpened).toBe(true);
+    expect(registry.has("provider-key")).toBe(true);
+    expect(releaseInstance("provider-key")).toBe(false);
   });
 });

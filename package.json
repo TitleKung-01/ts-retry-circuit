@@ -1,8 +1,8 @@
 {
   "name": "ts-retry-circuit",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "license": "MIT",
-  "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js and Next.js",
+  "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js, Next.js, and React",
   "author": "TitleKung-01",
   "repository": {
     "type": "git",
@@ -21,12 +21,20 @@
     "typescript",
     "nextjs",
     "isomorphic",
-    "resilience"
+    "resilience",
+    "opentelemetry",
+    "bulkhead"
   ],
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -37,29 +45,46 @@
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js",
       "require": "./dist/react.cjs"
+    },
+    "./otel": {
+      "types": "./dist/otel.d.ts",
+      "import": "./dist/otel.js",
+      "require": "./dist/otel.cjs"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "SEMVER.md"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "bench": "vitest bench --run",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "lint:fix": "eslint \"src/**/*.{ts,tsx}\" --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\"",
     "typecheck": "tsc --noEmit",
     "validate": "npm run typecheck && npm run lint && npm run format:check && npm run test:run",
-    "prepublishOnly": "npm run validate && npm run build"
+    "prepublishOnly": "npm run validate && npm run test:coverage && npm run build",
+    "prepare": "husky"
   },
   "peerDependencies": {
-    "react": "^18.0.0 || ^19.0.0 || ^20.0.0"
+    "react": "^18.0.0 || ^19.0.0 || ^20.0.0",
+    "@opentelemetry/api": "^1.9.0"
   },
   "peerDependenciesMeta": {
     "react": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
       "optional": true
     }
   },
@@ -67,7 +92,7 @@
     "src/**/*.{ts,tsx}": [
       "prettier --write",
       "eslint --fix",
-      "vitest run --related --passWithNoTests"
+      "vitest related --run --passWithNoTests"
     ]
   },
   "devDependencies": {
@@ -76,6 +101,7 @@
     "@types/react": "^19.2.17",
     "@typescript-eslint/eslint-plugin": "^8.64.0",
     "@typescript-eslint/parser": "^8.64.0",
+    "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10.7.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "happy-dom": "^20.11.0",

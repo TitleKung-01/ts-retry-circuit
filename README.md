@@ -1,24 +1,27 @@
 # ts-retry-circuit
 
-A production-grade, isomorphic, zero-dependency Circuit Breaker and Auto-Retry library with native React support. Designed for Node.js, Next.js, and React applications.
+TypeScript-first isomorphic resilience kit for Node.js, Next.js, and React — circuit breaker + retry + AbortSignal in one API, with UI-aware hooks and optional OpenTelemetry.
 
 [![NPM Version](https://img.shields.io/npm/v/ts-retry-circuit.svg)](https://www.npmjs.com/package/ts-retry-circuit)
+[![CI](https://github.com/TitleKung-01/ts-retry-circuit/actions/workflows/ci.yml/badge.svg)](https://github.com/TitleKung-01/ts-retry-circuit/actions/workflows/ci.yml)
 [![License](https://img.shields.io/npm/l/ts-retry-circuit.svg)](https://github.com/TitleKung-01/ts-retry-circuit/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
-[![Vitest](https://img.shields.io/badge/Tested%20with-Vitest-yellow.svg)](https://vitest.dev/)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org/)
 
 ---
 
 ## Features
 
-- **Isomorphic**: Runs in Node.js, Next.js (SSR & API routes), and React (client-side).
-- **Auto-Retry with Jitter**: Exponential backoff + full jitter in the `CLOSED` state.
-- **HALF-OPEN concurrency guard**: Exactly one probe request while recovering.
-- **Timeout & AbortSignal**: Per-attempt timeout and cooperative cancellation.
-- **Fallback**: Degrade gracefully when the circuit rejects or a request finally fails.
-- **Typed errors**: Stable `code` values instead of string-matching messages.
-- **Native React hook**: Bind circuit state to UI; share instances via `instanceKey`.
-- **Error filtering**: Exclude expected errors (e.g. `401`, `404`) from tripping the circuit.
+- **Isomorphic**: Node.js, Next.js (SSR & API routes), and React (client).
+- **Auto-Retry with Jitter**: Exponential backoff + full jitter in `CLOSED`.
+- **Trip strategies**: Consecutive failures (default) or rolling error-rate window.
+- **Bulkhead `capacity`**: Limit concurrent executions.
+- **Timeout & AbortSignal**: Per-attempt timeout aborts the attempt signal so `fetch`/work can cancel.
+- **Fallback + typed errors**: Stable `code` values for open/throttle/timeout/abort/capacity.
+- **Typed event bus**: `on("open" | "success" | ...)`
+- **Named registry**: Share breakers across a process via `CircuitBreaker.get(name)`.
+- **React**: `useCircuitBreaker`, `CircuitProvider`, richer metrics.
+- **Helpers**: `withCircuit`, `createCircuitFetch`, optional `ts-retry-circuit/otel`.
 
 ---
 
@@ -28,139 +31,124 @@ A production-grade, isomorphic, zero-dependency Circuit Breaker and Auto-Retry l
 npm install ts-retry-circuit
 ```
 
-```bash
-yarn add ts-retry-circuit
-pnpm add ts-retry-circuit
-bun add ts-retry-circuit
-```
-
----
-
-## Migrating from v1 to v2
-
-Breaking changes:
-
-1. Rejects when the circuit is open or throttled are typed errors (`CircuitOpenError`, `CircuitHalfOpenThrottledError`), not plain `Error` strings with emoji.
-2. Prefer `instanceof` / `.code` instead of matching `error.message`.
-3. New optional APIs: `timeout`, `fallback`, `halfOpenSuccessThreshold`, `execute(fn, { signal })`, `reset()`, `getMetrics()`.
-
-```typescript
-import { CircuitOpenError } from "ts-retry-circuit";
-
-try {
-  await breaker.execute(fn);
-} catch (error) {
-  if (error instanceof CircuitOpenError) {
-    console.log(`Retry after ${error.retryAfterMs}ms`);
-  }
-}
-```
+Requires **Node.js >= 20**.
 
 ---
 
 ## Quick Start
 
-### 1. Core API (Node.js, Next.js, TypeScript)
-
 ```typescript
 import { CircuitBreaker, CircuitOpenError } from "ts-retry-circuit";
 
 const breaker = new CircuitBreaker({
+  name: "payments-api",
   failureThreshold: 3,
   cooldownPeriod: 5000,
   maxRetries: 2,
-  initialRetryDelay: 1000,
   timeout: 3000,
-  halfOpenSuccessThreshold: 1,
-  isExpectedError: (error) => error instanceof ValidationError,
-  fallback: (error, { state }) => {
+  capacity: 50,
+  fallback: (error) => {
     if (error instanceof CircuitOpenError) {
-      return { degraded: true, retryAfterMs: error.retryAfterMs, state };
+      return { degraded: true, retryAfterMs: error.retryAfterMs };
     }
     throw error;
   },
 });
 
-async function fetchUserData() {
-  return breaker.execute(async () => {
-    const response = await fetch("https://api.example.com/user");
-    if (!response.ok) throw new Error("Internal Server Error");
-    return response.json();
-  });
-}
+const data = await breaker.execute(async (signal) => {
+  const res = await fetch("https://api.example.com/user", { signal });
+  if (!res.ok) throw new Error("upstream error");
+  return res.json();
+});
 ```
 
-### 2. React Integration (`useCircuitBreaker`)
+### Rolling window strategy
+
+```typescript
+const breaker = new CircuitBreaker({
+  failureThreshold: 100, // ignored for open decision when strategy is rolling
+  cooldownPeriod: 30_000,
+  strategy: "rolling",
+  volumeThreshold: 20,
+  errorThresholdPercentage: 50,
+  rollingWindowMs: 10_000,
+  maxRetries: 0,
+});
+```
+
+### React + provider (SSR-safe scoping)
 
 ```tsx
-import React from "react";
-import { useCircuitBreaker } from "ts-retry-circuit/react";
+import { CircuitProvider, useCircuitBreaker } from "ts-retry-circuit/react";
 
-function PaymentForm() {
-  const {
-    state,
-    execute,
-    reset,
-    isOpened,
-    isHalfOpen,
-    activeRequests,
-    failureCount,
-  } = useCircuitBreaker({
+export function App() {
+  return (
+    <CircuitProvider>
+      <CheckoutButton />
+    </CircuitProvider>
+  );
+}
+
+function CheckoutButton() {
+  const { state, execute, isOpened, metrics } = useCircuitBreaker({
+    instanceKey: "checkout",
     failureThreshold: 2,
-    cooldownPeriod: 10000,
-    maxRetries: 1,
+    cooldownPeriod: 10_000,
   });
 
-  const handleCheckout = async () => {
-    try {
-      await execute(async () => processPayment());
-    } catch (error) {
-      console.error("Payment failed:", error);
-    }
-  };
-
   return (
-    <div>
-      <p>System State: <strong>{state}</strong></p>
-      <p>Consecutive Failures: {failureCount}</p>
-
-      <button
-        onClick={handleCheckout}
-        disabled={isOpened || isHalfOpen || activeRequests > 0}
-      >
-        {activeRequests > 0
-          ? "Processing..."
-          : isOpened
-            ? "Service Temporarily Unavailable"
-            : "Pay Now"}
-      </button>
-
-      {isOpened ? (
-        <button type="button" onClick={reset}>
-          Reset circuit
-        </button>
-      ) : null}
-    </div>
+    <button
+      disabled={isOpened}
+      onClick={() => execute(async (signal) => processPayment(signal))}
+    >
+      Pay ({state}, fails={metrics.failureCount})
+    </button>
   );
 }
 ```
 
-### 3. Sharing Circuit State Across Components
+**SSR:** Create a **new** `CircuitProvider` registry per request. Do not share mutable breakers across RSC requests. Module-level `instanceKey` registry is fine for client-only / long-lived Node processes.
 
-Config is frozen at the first registration for a given `instanceKey`. Later mounts reuse that instance and ignore new config. Call `releaseInstance(key)` for tests or SPA teardown.
+### Fetch helper
 
-```tsx
-import { useCircuitBreaker, releaseInstance } from "ts-retry-circuit/react";
+```typescript
+import { CircuitBreaker, createCircuitFetch } from "ts-retry-circuit";
 
-const paymentBreaker = useCircuitBreaker({
-  instanceKey: "stripe-gateway-circuit",
-  failureThreshold: 3,
-  cooldownPeriod: 5000,
+const breaker = new CircuitBreaker({
+  failureThreshold: 5,
+  cooldownPeriod: 10_000,
+  timeout: 3000,
+  maxRetries: 1,
+});
+const circuitFetch = createCircuitFetch(breaker);
+
+const res = await circuitFetch("https://api.example.com/items", {
+  expectedStatuses: [404],
+});
+```
+
+### OpenTelemetry
+
+```typescript
+import { CircuitBreaker } from "ts-retry-circuit";
+import { instrumentCircuitBreaker } from "ts-retry-circuit/otel";
+
+const breaker = new CircuitBreaker({
+  name: "inventory",
+  failureThreshold: 5,
+  cooldownPeriod: 10_000,
 });
 
-// later / in tests
-releaseInstance("stripe-gateway-circuit");
+const stop = instrumentCircuitBreaker(breaker, {
+  meter, // from @opentelemetry/api
+});
 ```
+
+---
+
+## Migrating from v1 / v2.0
+
+See [CHANGELOG.md](./CHANGELOG.md). v2.1 is additive for v2.0 callers: `execute` now passes an `AbortSignal` as the first argument to your function (`async (signal) => ...`). Existing `async () => ...` callbacks remain valid.
 
 ---
 
@@ -168,69 +156,50 @@ releaseInstance("stripe-gateway-circuit");
 
 | Capability | ts-retry-circuit | opossum | cockatiel |
 | :--- | :--- | :--- | :--- |
-| Circuit + consecutive failures | Yes | Rolling % window | Consecutive or sampling |
-| Built-in retry + full jitter | Yes (`CLOSED` only) | Limited | Separate policy |
-| Native React hook + shared `instanceKey` | Yes | No | No |
-| Timeout / AbortSignal | Yes | Yes | Yes |
-| Fallback | Yes | Yes | Yes |
-| Typed reject reasons | Yes | Events mostly | Error codes |
-| Bulkhead / policy compose / Prometheus | No (out of scope) | Partial / plugin | Yes / no native prom |
+| TypeScript-native + isomorphic | Yes | Node-focused | Yes |
+| Circuit + consecutive **or** rolling % | Yes | Rolling % | Policies |
+| Built-in retry + full jitter | Yes (`CLOSED`) | Limited | Separate |
+| Native React hook + `CircuitProvider` | Yes | No | No |
+| Timeout aborts attempt `AbortSignal` | Yes | Yes | Yes |
+| Bulkhead capacity | Yes | Yes | Yes |
+| Typed events + OTel helper | Yes | Events + prom plugin | Limited |
+| Policy composition framework | No (by design) | No | Yes |
+
+More recipes: [docs/COOKBOOK.md](./docs/COOKBOOK.md) · Versioning: [SEMVER.md](./SEMVER.md) · Security: [SECURITY.md](./SECURITY.md)
 
 ---
 
-## API Reference
+## API (summary)
 
-### `CircuitConfig`
+### `CircuitConfig` (new / notable)
 
-| Property | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `failureThreshold` | `number` | **Required** | Consecutive failures to open the circuit. |
-| `cooldownPeriod` | `number` | **Required** | Ms to stay `OPEN` before `HALF-OPEN`. |
-| `maxRetries` | `number` | `3` | Retries while `CLOSED`. |
-| `initialRetryDelay` | `number` | `500` | Initial backoff delay (ms). |
-| `timeout` | `number` | `undefined` | Per-attempt timeout (ms). |
-| `halfOpenSuccessThreshold` | `number` | `1` | Successes in `HALF-OPEN` before `CLOSED`. |
-| `isExpectedError` | `(err) => boolean` | `undefined` | Errors that do not count as failures. |
-| `fallback` | `(err, ctx) => unknown` | `undefined` | Used on OPEN/throttle/final failure (not expected errors). |
+| Property | Default | Description |
+| :--- | :--- | :--- |
+| `strategy` | `"consecutive"` | `"rolling"` uses error % window |
+| `capacity` | unlimited | Max concurrent `execute` calls |
+| `name` | — | Registers in `CircuitRegistry` |
+| `errorThresholdPercentage` | `50` | Rolling only |
+| `volumeThreshold` | `5` | Rolling only |
+| `rollingWindowMs` / `rollingBuckets` | `10000` / `10` | Rolling window |
 
-### `CircuitBreaker`
+### Events
 
-- `execute<T>(fn, options?: { signal?: AbortSignal }): Promise<T>`
-- `getStatus(): CircuitStatus`
-- `getMetrics(): CircuitMetrics`
-- `reset(): void`
-- `subscribe(listener): () => void`
+`open` · `close` · `halfOpen` · `success` · `failure` · `reject` · `timeout` · `fallback` · `retry`
 
 ### Typed errors
 
-| Class | `code` | When |
-| :--- | :--- | :--- |
-| `CircuitOpenError` | `CIRCUIT_OPEN` | Circuit is `OPEN` (`retryAfterMs` included) |
-| `CircuitHalfOpenThrottledError` | `CIRCUIT_HALF_OPEN_THROTTLED` | Extra probe while `HALF-OPEN` |
-| `CircuitTimeoutError` | `CIRCUIT_TIMEOUT` | Attempt exceeded `timeout` |
-| `CircuitAbortedError` | `CIRCUIT_ABORTED` | `AbortSignal` aborted |
-
-### `useCircuitBreaker` result
-
-| Property | Type | Description |
-| :--- | :--- | :--- |
-| `state` | `CircuitState` | `'CLOSED' \| 'OPEN' \| 'HALF-OPEN'` |
-| `failureCount` | `number` | Consecutive failures in the current cycle |
-| `activeRequests` | `number` | In-flight requests through this breaker |
-| `execute` | `(fn, options?) => Promise<T>` | Run work through the breaker |
-| `reset` | `() => void` | Force `CLOSED` and clear counters |
-| `isOpened` | `boolean` | `state === 'OPEN'` |
-| `isHalfOpen` | `boolean` | `state === 'HALF-OPEN'` |
+`CircuitOpenError` · `CircuitHalfOpenThrottledError` · `CircuitTimeoutError` · `CircuitAbortedError` · `CircuitCapacityRejectedError`
 
 ---
 
-## Development & Testing
+## Development
 
 ```bash
 npm install
 npm run validate
-npm run test:run
+npm run test:coverage
 npm run build
+npm run bench
 ```
 
 ---

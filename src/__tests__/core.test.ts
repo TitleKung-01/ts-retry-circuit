@@ -1,19 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   CircuitBreaker,
+  CircuitRegistry,
   CircuitOpenError,
   CircuitHalfOpenThrottledError,
   CircuitTimeoutError,
   CircuitAbortedError,
+  CircuitCapacityRejectedError,
+  isCircuitError,
 } from "../core.js";
 
 describe("CircuitBreaker", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    CircuitRegistry.clear();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    CircuitRegistry.clear();
   });
 
   it("should successfully execute a function when CLOSED", async () => {
@@ -413,5 +418,196 @@ describe("CircuitBreaker", () => {
     expect(breaker.getStatus().nextAttemptTime).toBe(0);
 
     await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
+  });
+
+  it("should validate constructor options", () => {
+    expect(
+      () => new CircuitBreaker({ failureThreshold: 0, cooldownPeriod: 1 }),
+    ).toThrow(/failureThreshold/);
+    expect(
+      () => new CircuitBreaker({ failureThreshold: 1, cooldownPeriod: 0 }),
+    ).toThrow(/cooldownPeriod/);
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1,
+          timeout: 0,
+        }),
+    ).toThrow(/timeout/);
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1,
+          capacity: 0,
+        }),
+    ).toThrow(/capacity/);
+  });
+
+  it("isCircuitError recognizes typed errors", () => {
+    expect(isCircuitError(new CircuitOpenError(10))).toBe(true);
+    expect(isCircuitError(new CircuitCapacityRejectedError(2))).toBe(true);
+    expect(isCircuitError(new Error("x"))).toBe(false);
+  });
+
+  it("should emit typed events", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      name: "events",
+    });
+    const open = vi.fn();
+    const failure = vi.fn();
+    breaker.on("open", open);
+    breaker.on("failure", failure);
+
+    await expect(
+      breaker.execute(async () => {
+        throw new Error("fail");
+      }),
+    ).rejects.toThrow("fail");
+
+    expect(failure).toHaveBeenCalled();
+    expect(open).toHaveBeenCalled();
+    expect(open.mock.calls[0][0].name).toBe("events");
+  });
+
+  it("should enforce capacity bulkhead", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 5,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      capacity: 1,
+    });
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const first = breaker.execute(async () => {
+      await gate;
+      return "ok";
+    });
+    await Promise.resolve();
+
+    await expect(breaker.execute(async () => "nope")).rejects.toBeInstanceOf(
+      CircuitCapacityRejectedError,
+    );
+    expect(breaker.getMetrics().rejectedCount).toBe(1);
+
+    release();
+    await expect(first).resolves.toBe("ok");
+  });
+
+  it("should register named breakers", () => {
+    const a = CircuitBreaker.get("payments", {
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+    });
+    const b = CircuitBreaker.get("payments");
+    expect(a).toBe(b);
+    expect(CircuitRegistry.keys()).toContain("payments");
+    expect(CircuitBreaker.release("payments")).toBe(true);
+  });
+
+  it("should trip on rolling error percentage", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 100,
+      cooldownPeriod: 5000,
+      maxRetries: 0,
+      strategy: "rolling",
+      volumeThreshold: 4,
+      errorThresholdPercentage: 50,
+      rollingWindowMs: 10_000,
+      rollingBuckets: 10,
+    });
+
+    await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
+    await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
+    await expect(
+      breaker.execute(async () => {
+        throw new Error("a");
+      }),
+    ).rejects.toThrow("a");
+    expect(breaker.getStatus().state).toBe("CLOSED");
+
+    await expect(
+      breaker.execute(async () => {
+        throw new Error("b");
+      }),
+    ).rejects.toThrow("b");
+    expect(breaker.getStatus().state).toBe("OPEN");
+  });
+
+  it("should abort in-flight work via timeout signal", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      timeout: 50,
+    });
+
+    let sawAbort = false;
+    const promise = breaker.execute(async (signal) => {
+      await new Promise<void>((resolve, reject) => {
+        const id = setTimeout(() => resolve(), 200);
+        signal.addEventListener("abort", () => {
+          sawAbort = true;
+          clearTimeout(id);
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+      return "late";
+    });
+
+    const assertion =
+      expect(promise).rejects.toBeInstanceOf(CircuitTimeoutError);
+    await vi.advanceTimersByTimeAsync(50);
+    await assertion;
+    expect(sawAbort).toBe(true);
+    expect(breaker.getMetrics().timeoutCount).toBe(1);
+  });
+
+  it("should track richer metrics", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 5,
+      cooldownPeriod: 1000,
+      maxRetries: 1,
+      initialRetryDelay: 10,
+    });
+
+    let calls = 0;
+    const promise = breaker.execute(async () => {
+      calls++;
+      if (calls === 1) throw new Error("once");
+      return "ok";
+    });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    const metrics = breaker.getMetrics();
+    expect(metrics.successCount).toBe(1);
+    expect(metrics.retryCount).toBe(1);
+    expect(metrics.attemptCount).toBe(2);
+    expect(metrics.totalDurationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("should support concurrent CLOSED executions", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 5,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+
+    const results = await Promise.all([
+      breaker.execute(async () => "a"),
+      breaker.execute(async () => "b"),
+      breaker.execute(async () => "c"),
+    ]);
+    expect(results).toEqual(["a", "b", "c"]);
+    expect(breaker.getStatus().activeRequests).toBe(0);
   });
 });
