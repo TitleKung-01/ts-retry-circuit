@@ -235,6 +235,14 @@ npm run build
 
 ---
 
+## Further reading
+
+- [Cookbook](docs/COOKBOOK.md) — fetch, Next.js, React, fallback, metrics patterns
+- [Versioning (SemVer)](SEMVER.md) — what counts as major / minor / patch
+- [Security](SECURITY.md) — supported versions and vulnerability reporting
+
+---
+
 ## License
 
 MIT © [TitleKung-01](https://github.com/TitleKung-01)
