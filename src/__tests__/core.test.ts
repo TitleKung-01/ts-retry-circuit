@@ -414,4 +414,95 @@ describe("CircuitBreaker", () => {
 
     await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
   });
+
+  it("should reject out-of-range config values", () => {
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 2,
+          cooldownPeriod: 1000,
+          maxRetries: 21,
+        }),
+    ).toThrow(/maxRetries/);
+
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 2,
+          cooldownPeriod: 1000,
+          initialRetryDelay: 0,
+        }),
+    ).toThrow(/initialRetryDelay/);
+
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 0,
+          cooldownPeriod: 1000,
+        }),
+    ).toThrow(/failureThreshold/);
+  });
+
+  it("should abort the attempt signal when timing out", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      timeout: 50,
+    });
+
+    let sawAbort = false;
+    const promise = breaker.execute(({ signal }) => {
+      return new Promise((resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            sawAbort = true;
+            reject(new Error("aborted by signal"));
+          },
+          { once: true },
+        );
+        setTimeout(() => resolve("late"), 200);
+      });
+    });
+
+    const assertion =
+      expect(promise).rejects.toBeInstanceOf(CircuitTimeoutError);
+    await vi.advanceTimersByTimeAsync(50);
+    await assertion;
+    expect(sawAbort).toBe(true);
+  });
+
+  it("should abort work when the caller signal aborts mid-flight", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+
+    const controller = new AbortController();
+    let sawAbort = false;
+
+    const promise = breaker.execute(
+      ({ signal }) =>
+        new Promise((resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              sawAbort = true;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+          setTimeout(() => resolve("done"), 5_000);
+        }),
+      { signal: controller.signal },
+    );
+
+    const assertion =
+      expect(promise).rejects.toBeInstanceOf(CircuitAbortedError);
+    controller.abort();
+    await assertion;
+    expect(sawAbort).toBe(true);
+  });
 });

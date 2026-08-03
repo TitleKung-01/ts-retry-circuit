@@ -4,7 +4,8 @@
 
 | Version | Supported |
 | :--- | :--- |
-| 2.x | Yes |
+| 2.1.x | Yes |
+| 2.0.x | Yes (upgrade recommended) |
 | 1.x | No (upgrade to 2.x) |
 | < 1.0 | No |
 
@@ -38,14 +39,35 @@ Out of scope:
 
 - Vulnerabilities in consumer application code that merely *uses* the library
 - Issues that require unrealistic privileges on the host already compromised
-- Denial of service caused solely by intentional misconfiguration (e.g. unbounded retries with zero delay)
+- Denial of service from values already rejected by config bounds (callers must catch constructor errors)
+
+## Hardening in 2.1
+
+| Risk | Mitigation |
+| :--- | :--- |
+| Unbounded retries / delays | Constructor enforces hard config bounds |
+| Timeout leaving work running | Each attempt gets an `AbortSignal`; timeout aborts it |
+| React registry growth | `instanceKey` ref-counted; removed when last subscriber unmounts |
+| Unsafe `instanceKey` shapes | Keys must match `^[a-zA-Z0-9:_./-]+$` (max 128) |
+| Accidental HALF-OPEN stampede | Synchronous `halfOpenProbeActive` guard |
+| Accidental public reset | `reset()` remains available but documented as ops/admin/tests only |
+
+Publish surface remains `files: ["dist"]` with zero runtime dependencies. Prefer lockfiles and `npm audit` in consuming apps.
 
 ## Safe usage notes
 
+- Pass the attempt signal into I/O: `execute(({ signal }) => fetch(url, { signal }))`
 - Prefer typed errors (`instanceof` / `.code`) over parsing `error.message`
 - Do not put secrets into fallback return values that may be logged
-- Bound `maxRetries`, `timeout`, and `cooldownPeriod` appropriately for your dependency
-- Treat `releaseInstance` / shared `instanceKey` carefully in multi-tenant frontends so tenants do not share circuit state unintentionally
+- Use stable dependency `instanceKey` values (e.g. `"payments"`). Do **not** use end-user ids
+- Do not bind `reset()` to a public end-user control; wrap auth at the application layer if needed
+- Fallback return values must match the expected success shape; otherwise rethrow
+
+## Residual risks (accepted)
+
+- If the consumer ignores `signal`, underlying I/O may continue after timeout
+- Anyone holding a breaker reference can call `reset()`; enforce authorization in the app
+- Intentionally shared `instanceKey` values share circuit state by design
 
 ## Disclosure
 

@@ -47,3 +47,4 @@ Optional tags such as `2.1.0-beta.1` may be published for early feedback. Pre-re
 ## Historical note
 
 - **v1 → v2**: Typed circuit errors replaced emoji plain `Error` rejects; callers matching `error.message` must migrate to `instanceof` / `.code`. See README “Migrating from v1 to v2”.
+- **v2.1.0**: Security hardening MINOR — config bounds, attempt `AbortSignal`, HALF-OPEN probe flag, React registry ref-counting + `instanceKey` validation. Existing `execute(async () => …)` call sites remain valid; prefer `execute(({ signal }) => …)`.

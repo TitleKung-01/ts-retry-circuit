@@ -20,8 +20,8 @@ const apiBreaker = new CircuitBreaker({
 
 export async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
   try {
-    return await apiBreaker.execute(async () => {
-      const response = await fetch(url, init);
+    return await apiBreaker.execute(async ({ signal }) => {
+      const response = await fetch(url, { ...init, signal });
       if (!response.ok) {
         const error = new Error(`HTTP ${response.status}`);
         (error as Error & { status: number }).status = response.status;
@@ -63,11 +63,12 @@ import { paymentBreaker } from "@/lib/payment-breaker";
 export async function POST(request: Request) {
   const body = await request.json();
 
-  const result = await paymentBreaker.execute(async () => {
+  const result = await paymentBreaker.execute(async ({ signal }) => {
     const res = await fetch(process.env.PAYMENT_URL!, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
     if (!res.ok) throw new Error(`Payment failed: ${res.status}`);
     return res.json();
@@ -101,19 +102,33 @@ const breaker = new CircuitBreaker({
 
 ## Cancel in-flight work with AbortSignal
 
+Always forward the attempt signal into I/O so timeout/abort stops real work:
+
+```typescript
+await breaker.execute(({ signal }) => fetch(url, { signal }));
+```
+
+You can also link a caller-owned signal:
+
 ```typescript
 const controller = new AbortController();
 const timeout = setTimeout(() => controller.abort(), 2_000);
 
 try {
   await breaker.execute(
-    async () => fetch("/slow", { signal: controller.signal }).then((r) => r.json()),
+    ({ signal }) => fetch("/slow", { signal }).then((r) => r.json()),
     { signal: controller.signal },
   );
 } finally {
   clearTimeout(timeout);
 }
 ```
+
+| Client | Pass signal? |
+| :--- | :--- |
+| `fetch` | Yes — `{ signal }` |
+| Axios | Yes — `{ signal }` (v0.22+) |
+| Many DB drivers | Only if the API accepts AbortSignal; otherwise timeout still fails the attempt but may not cancel the driver |
 
 ## React: disable UI while open
 
@@ -143,6 +158,8 @@ export function SaveButton({ onSave }: { onSave: () => Promise<void> }) {
 ## React: share one circuit across components
 
 Config is frozen at the first registration for a given `instanceKey`.
+Keys must match `^[a-zA-Z0-9:_./-]+$` (max 128). Use a stable dependency name — never an end-user id.
+The registry ref-counts subscribers and drops the entry when the last hook unmounts.
 
 ```tsx
 import { useCircuitBreaker, releaseInstance } from "ts-retry-circuit/react";
@@ -155,7 +172,7 @@ function usePaymentsCircuit() {
   });
 }
 
-// In tests / SPA teardown:
+// Force-remove in tests / SPA teardown if needed:
 releaseInstance("payments");
 ```
 
@@ -210,4 +227,5 @@ new CircuitBreaker({
 breaker.reset(); // force CLOSED and clear consecutive failure counters
 ```
 
-Prefer letting cooldown + HALF-OPEN recover automatically in production; use `reset()` for admin tools or tests.
+Prefer letting cooldown + HALF-OPEN recover automatically in production.
+Do **not** bind `reset()` to a public end-user button; keep it for admin tools or tests.

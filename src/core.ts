@@ -13,28 +13,35 @@ export interface CircuitFallbackContext {
   state: CircuitState;
 }
 
+export interface ExecuteContext {
+  signal: AbortSignal;
+}
+
+export type ExecuteWork<T> = (ctx: ExecuteContext) => Promise<T>;
+
 export interface CircuitConfig {
-  /** Consecutive failures required to transition to OPEN */
+  /** Consecutive failures required to transition to OPEN (1..1000) */
   failureThreshold: number;
-  /** Milliseconds to stay OPEN before entering HALF-OPEN */
+  /** Milliseconds to stay OPEN before entering HALF-OPEN (1..86400000) */
   cooldownPeriod: number;
-  /** Max retries while CLOSED (default: 3) */
+  /** Max retries while CLOSED (0..20, default: 3) */
   maxRetries?: number;
-  /** Initial delay in ms for exponential full-jitter backoff (default: 500) */
+  /** Initial delay in ms for exponential full-jitter backoff (1..60000, default: 500) */
   initialRetryDelay?: number;
   /** Errors returning true are rethrown without counting as circuit failures */
   isExpectedError?: (error: unknown) => boolean;
-  /** Per-attempt timeout in ms; timed-out attempts count as failures */
+  /** Per-attempt timeout in ms (1..300000); timed-out attempts count as failures */
   timeout?: number;
   /**
    * Invoked when the circuit rejects (OPEN / HALF-OPEN throttle) or after
    * final counted failure. Not used for expected errors.
+   * Consumer is responsible for returning a value matching the expected T.
    */
   fallback?: (
     error: unknown,
     context: CircuitFallbackContext,
   ) => unknown | Promise<unknown>;
-  /** Successes required in HALF-OPEN before returning to CLOSED (default: 1) */
+  /** Successes required in HALF-OPEN before returning to CLOSED (1..100, default: 1) */
   halfOpenSuccessThreshold?: number;
 }
 
@@ -56,12 +63,87 @@ export interface ExecuteOptions {
   signal?: AbortSignal;
 }
 
+const CONFIG_BOUNDS = {
+  failureThreshold: { min: 1, max: 1000 },
+  cooldownPeriod: { min: 1, max: 86_400_000 },
+  maxRetries: { min: 0, max: 20 },
+  initialRetryDelay: { min: 1, max: 60_000 },
+  timeout: { min: 1, max: 300_000 },
+  halfOpenSuccessThreshold: { min: 1, max: 100 },
+} as const;
+
+function assertInRange(
+  name: string,
+  value: number,
+  min: number,
+  max: number,
+): void {
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+}
+
+function assertConfig(config: CircuitConfig): {
+  maxRetries: number;
+  initialRetryDelay: number;
+  halfOpenSuccessThreshold: number;
+} {
+  assertInRange(
+    "failureThreshold",
+    config.failureThreshold,
+    CONFIG_BOUNDS.failureThreshold.min,
+    CONFIG_BOUNDS.failureThreshold.max,
+  );
+  assertInRange(
+    "cooldownPeriod",
+    config.cooldownPeriod,
+    CONFIG_BOUNDS.cooldownPeriod.min,
+    CONFIG_BOUNDS.cooldownPeriod.max,
+  );
+
+  const maxRetries = config.maxRetries ?? 3;
+  assertInRange(
+    "maxRetries",
+    maxRetries,
+    CONFIG_BOUNDS.maxRetries.min,
+    CONFIG_BOUNDS.maxRetries.max,
+  );
+
+  const initialRetryDelay = config.initialRetryDelay ?? 500;
+  assertInRange(
+    "initialRetryDelay",
+    initialRetryDelay,
+    CONFIG_BOUNDS.initialRetryDelay.min,
+    CONFIG_BOUNDS.initialRetryDelay.max,
+  );
+
+  if (config.timeout !== undefined) {
+    assertInRange(
+      "timeout",
+      config.timeout,
+      CONFIG_BOUNDS.timeout.min,
+      CONFIG_BOUNDS.timeout.max,
+    );
+  }
+
+  const halfOpenSuccessThreshold = config.halfOpenSuccessThreshold ?? 1;
+  assertInRange(
+    "halfOpenSuccessThreshold",
+    halfOpenSuccessThreshold,
+    CONFIG_BOUNDS.halfOpenSuccessThreshold.min,
+    CONFIG_BOUNDS.halfOpenSuccessThreshold.max,
+  );
+
+  return { maxRetries, initialRetryDelay, halfOpenSuccessThreshold };
+}
+
 export class CircuitBreaker {
   private state: CircuitState = "CLOSED";
   private failureCount: number = 0;
   private halfOpenSuccessCount: number = 0;
   private nextAttemptTime: number = 0;
   private activeRequests: number = 0;
+  private halfOpenProbeActive: boolean = false;
   private successCount: number = 0;
   private openedCount: number = 0;
   private rejectedCount: number = 0;
@@ -94,31 +176,21 @@ export class CircuitBreaker {
   }
 
   constructor(config: CircuitConfig) {
-    if (config.failureThreshold <= 0)
-      throw new Error("failureThreshold must be greater than 0");
-    if (config.cooldownPeriod <= 0)
-      throw new Error("cooldownPeriod must be greater than 0");
-    if (config.timeout !== undefined && config.timeout <= 0)
-      throw new Error("timeout must be greater than 0");
-    if (
-      config.halfOpenSuccessThreshold !== undefined &&
-      config.halfOpenSuccessThreshold <= 0
-    )
-      throw new Error("halfOpenSuccessThreshold must be greater than 0");
+    const normalized = assertConfig(config);
 
     this.failureThreshold = config.failureThreshold;
     this.cooldownPeriod = config.cooldownPeriod;
-    this.maxRetries = config.maxRetries ?? 3;
-    this.initialRetryDelay = config.initialRetryDelay ?? 500;
+    this.maxRetries = normalized.maxRetries;
+    this.initialRetryDelay = normalized.initialRetryDelay;
     this.isExpectedError = config.isExpectedError;
     this.timeout = config.timeout;
     this.fallback = config.fallback;
-    this.halfOpenSuccessThreshold = config.halfOpenSuccessThreshold ?? 1;
+    this.halfOpenSuccessThreshold = normalized.halfOpenSuccessThreshold;
   }
 
-  async execute<T>(fn: () => Promise<T>, options?: ExecuteOptions): Promise<T> {
-    const signal = options?.signal;
-    this.throwIfAborted(signal);
+  async execute<T>(fn: ExecuteWork<T>, options?: ExecuteOptions): Promise<T> {
+    const externalSignal = options?.signal;
+    this.throwIfAborted(externalSignal);
     this.updateState();
 
     if (this.state === "OPEN") {
@@ -129,11 +201,16 @@ export class CircuitBreaker {
       return this.applyFallbackOrThrow<T>(error);
     }
 
-    if (this.state === "HALF-OPEN" && this.activeRequests > 0) {
+    if (this.state === "HALF-OPEN" && this.halfOpenProbeActive) {
       const error = new CircuitHalfOpenThrottledError();
       this.rejectedCount++;
       this.emitStateChange();
       return this.applyFallbackOrThrow<T>(error);
+    }
+
+    const holdingHalfOpenProbe = this.state === "HALF-OPEN";
+    if (holdingHalfOpenProbe) {
+      this.halfOpenProbeActive = true;
     }
 
     this.activeRequests++;
@@ -142,9 +219,9 @@ export class CircuitBreaker {
 
     try {
       while (true) {
-        this.throwIfAborted(signal);
+        this.throwIfAborted(externalSignal);
         try {
-          const result = await this.runAttempt(fn, signal);
+          const result = await this.runAttempt(fn, externalSignal);
           this.onSuccess();
           return result;
         } catch (error) {
@@ -162,7 +239,7 @@ export class CircuitBreaker {
             const backoffLimit =
               this.initialRetryDelay * Math.pow(2, attempt - 1);
             const jitteredDelay = Math.random() * backoffLimit;
-            await this.sleep(jitteredDelay, signal);
+            await this.sleep(jitteredDelay, externalSignal);
             continue;
           }
 
@@ -172,6 +249,9 @@ export class CircuitBreaker {
       }
     } finally {
       this.activeRequests--;
+      if (holdingHalfOpenProbe) {
+        this.halfOpenProbeActive = false;
+      }
       this.emitStateChange();
     }
   }
@@ -187,9 +267,9 @@ export class CircuitBreaker {
   }
 
   public getMetrics(): CircuitMetrics {
-    this.updateState();
+    const status = this.getStatus();
     return {
-      ...this.getStatus(),
+      ...status,
       successCount: this.successCount,
       halfOpenSuccessCount: this.halfOpenSuccessCount,
       openedCount: this.openedCount,
@@ -197,6 +277,12 @@ export class CircuitBreaker {
     };
   }
 
+  /**
+   * Force the circuit back to CLOSED and clear consecutive failure counters.
+   *
+   * @remarks Dangerous in production UI — ops, admin tools, and tests only.
+   * Do not bind this to a public end-user control.
+   */
   public reset(): void {
     const previousState = this.state;
     const previousFailureCount = this.failureCount;
@@ -206,6 +292,7 @@ export class CircuitBreaker {
     this.failureCount = 0;
     this.halfOpenSuccessCount = 0;
     this.nextAttemptTime = 0;
+    this.halfOpenProbeActive = false;
 
     if (
       previousState !== "CLOSED" ||
@@ -218,94 +305,100 @@ export class CircuitBreaker {
 
   private async applyFallbackOrThrow<T>(error: unknown): Promise<T> {
     if (this.fallback) {
+      // Consumer owns the returned shape; cast is intentional at this boundary.
       return (await this.fallback(error, { state: this.state })) as T;
     }
     throw error;
   }
 
   private async runAttempt<T>(
-    fn: () => Promise<T>,
-    signal?: AbortSignal,
+    fn: ExecuteWork<T>,
+    externalSignal?: AbortSignal,
   ): Promise<T> {
-    this.throwIfAborted(signal);
+    this.throwIfAborted(externalSignal);
 
-    if (this.timeout === undefined) {
-      return this.raceWithAbort(fn(), signal);
-    }
-
-    const timeoutMs = this.timeout;
+    const controller = new AbortController();
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+
+    const onExternalAbort = () => {
+      controller.abort();
+    };
+
+    const cleanup = () => {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+        timeoutId = undefined;
+      }
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+    };
 
     try {
-      return await new Promise<T>((resolve, reject) => {
-        const onAbort = () => {
-          cleanup();
-          reject(new CircuitAbortedError());
-        };
+      if (externalSignal) {
+        if (externalSignal.aborted) {
+          throw new CircuitAbortedError();
+        }
+        externalSignal.addEventListener("abort", onExternalAbort, {
+          once: true,
+        });
+      }
 
-        const cleanup = () => {
-          if (timeoutId !== undefined) clearTimeout(timeoutId);
-          signal?.removeEventListener("abort", onAbort);
-        };
-
+      if (this.timeout !== undefined) {
+        const timeoutMs = this.timeout;
         timeoutId = setTimeout(() => {
-          cleanup();
-          reject(new CircuitTimeoutError(timeoutMs));
+          controller.abort();
         }, timeoutMs);
+      }
 
-        if (signal) {
-          if (signal.aborted) {
-            cleanup();
-            reject(new CircuitAbortedError());
+      return await new Promise<T>((resolve, reject) => {
+        const finishReject = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+
+        const finishResolve = (value: T) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(value);
+        };
+
+        const onAttemptAbort = () => {
+          if (externalSignal?.aborted) {
+            finishReject(new CircuitAbortedError());
             return;
           }
-          signal.addEventListener("abort", onAbort, { once: true });
+          finishReject(new CircuitTimeoutError(this.timeout ?? 0));
+        };
+
+        if (controller.signal.aborted) {
+          onAttemptAbort();
+          return;
         }
 
-        fn()
+        controller.signal.addEventListener("abort", onAttemptAbort, {
+          once: true,
+        });
+
+        fn({ signal: controller.signal })
           .then((value) => {
-            cleanup();
-            resolve(value);
+            controller.signal.removeEventListener("abort", onAttemptAbort);
+            finishResolve(value);
           })
           .catch((err: unknown) => {
-            cleanup();
-            reject(err);
+            controller.signal.removeEventListener("abort", onAttemptAbort);
+            if (controller.signal.aborted) {
+              onAttemptAbort();
+              return;
+            }
+            finishReject(err);
           });
       });
     } finally {
-      if (timeoutId !== undefined) clearTimeout(timeoutId);
+      cleanup();
     }
-  }
-
-  private raceWithAbort<T>(
-    promise: Promise<T>,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    if (!signal) return promise;
-
-    return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) {
-        reject(new CircuitAbortedError());
-        return;
-      }
-
-      const onAbort = () => {
-        signal.removeEventListener("abort", onAbort);
-        reject(new CircuitAbortedError());
-      };
-
-      signal.addEventListener("abort", onAbort, { once: true });
-
-      promise
-        .then((value) => {
-          signal.removeEventListener("abort", onAbort);
-          resolve(value);
-        })
-        .catch((err: unknown) => {
-          signal.removeEventListener("abort", onAbort);
-          reject(err);
-        });
-    });
   }
 
   private onSuccess() {

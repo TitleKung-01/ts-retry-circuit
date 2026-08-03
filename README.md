@@ -82,8 +82,8 @@ const breaker = new CircuitBreaker({
 });
 
 async function fetchUserData() {
-  return breaker.execute(async () => {
-    const response = await fetch("https://api.example.com/user");
+  return breaker.execute(async ({ signal }) => {
+    const response = await fetch("https://api.example.com/user", { signal });
     if (!response.ok) throw new Error("Internal Server Error");
     return response.json();
   });
@@ -137,7 +137,7 @@ function PaymentForm() {
 
       {isOpened ? (
         <button type="button" onClick={reset}>
-          Reset circuit
+          Reset circuit (admin only)
         </button>
       ) : null}
     </div>
@@ -147,7 +147,7 @@ function PaymentForm() {
 
 ### 3. Sharing Circuit State Across Components
 
-Config is frozen at the first registration for a given `instanceKey`. Later mounts reuse that instance and ignore new config. Call `releaseInstance(key)` for tests or SPA teardown.
+Config is frozen at the first registration for a given `instanceKey`. Later mounts reuse that instance and ignore new config. Keys must be stable dependency names (`^[a-zA-Z0-9:_./-]+$`); the registry drops an entry when the last subscriber unmounts. Call `releaseInstance(key)` to force-remove.
 
 ```tsx
 import { useCircuitBreaker, releaseInstance } from "ts-retry-circuit/react";
@@ -182,23 +182,23 @@ releaseInstance("stripe-gateway-circuit");
 
 ### `CircuitConfig`
 
-| Property | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `failureThreshold` | `number` | **Required** | Consecutive failures to open the circuit. |
-| `cooldownPeriod` | `number` | **Required** | Ms to stay `OPEN` before `HALF-OPEN`. |
-| `maxRetries` | `number` | `3` | Retries while `CLOSED`. |
-| `initialRetryDelay` | `number` | `500` | Initial backoff delay (ms). |
-| `timeout` | `number` | `undefined` | Per-attempt timeout (ms). |
-| `halfOpenSuccessThreshold` | `number` | `1` | Successes in `HALF-OPEN` before `CLOSED`. |
-| `isExpectedError` | `(err) => boolean` | `undefined` | Errors that do not count as failures. |
-| `fallback` | `(err, ctx) => unknown` | `undefined` | Used on OPEN/throttle/final failure (not expected errors). |
+| Property | Type | Default | Bounds | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `failureThreshold` | `number` | **Required** | 1..1000 | Consecutive failures to open the circuit. |
+| `cooldownPeriod` | `number` | **Required** | 1..86400000 | Ms to stay `OPEN` before `HALF-OPEN`. |
+| `maxRetries` | `number` | `3` | 0..20 | Retries while `CLOSED`. |
+| `initialRetryDelay` | `number` | `500` | 1..60000 | Initial backoff delay (ms). |
+| `timeout` | `number` | `undefined` | 1..300000 | Per-attempt timeout (ms). |
+| `halfOpenSuccessThreshold` | `number` | `1` | 1..100 | Successes in `HALF-OPEN` before `CLOSED`. |
+| `isExpectedError` | `(err) => boolean` | `undefined` | — | Errors that do not count as failures. |
+| `fallback` | `(err, ctx) => unknown` | `undefined` | — | Used on OPEN/throttle/final failure (not expected errors). |
 
 ### `CircuitBreaker`
 
-- `execute<T>(fn, options?: { signal?: AbortSignal }): Promise<T>`
+- `execute<T>(fn: (ctx: { signal: AbortSignal }) => Promise<T>, options?: { signal?: AbortSignal }): Promise<T>` — prefer forwarding `ctx.signal` into I/O
 - `getStatus(): CircuitStatus`
 - `getMetrics(): CircuitMetrics`
-- `reset(): void`
+- `reset(): void` — ops/admin/tests only; do not bind to public UI
 - `subscribe(listener): () => void`
 
 ### Typed errors
