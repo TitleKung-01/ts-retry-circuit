@@ -6,6 +6,7 @@ import {
   releaseInstance,
   CircuitProvider,
   assertInstanceKey,
+  type UseCircuitBreakerOptions,
 } from "../react.js";
 
 describe("useCircuitBreaker", () => {
@@ -225,6 +226,52 @@ describe("useCircuitBreaker", () => {
     expect(result.current.isOpened).toBe(true);
     expect(registry.has("provider-key")).toBe(true);
     expect(releaseInstance("provider-key")).toBe(false);
+  });
+
+  it("should support CircuitProvider with default registry and custom CircuitRegistryLike", async () => {
+    const wrapperDefault = ({ children }: { children: ReactNode }) =>
+      createElement(CircuitProvider, { children });
+
+    const { result: defaultHook } = renderHook(
+      () =>
+        useCircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          instanceKey: "def-key",
+        }),
+      { wrapper: wrapperDefault },
+    );
+    expect(defaultHook.current.state).toBe("CLOSED");
+
+    const customBreakers = new Map();
+    const customRegistry = {
+      get: (name: string) => customBreakers.get(name),
+      getOrCreate: (name: string, config: UseCircuitBreakerOptions) => {
+        let b = customBreakers.get(name);
+        if (!b) {
+          b = defaultHook.current.breaker;
+          customBreakers.set(name, b);
+        }
+        return b;
+      },
+      release: (name: string) => customBreakers.delete(name),
+    };
+
+    const wrapperCustom = ({ children }: { children: ReactNode }) =>
+      createElement(CircuitProvider, { registry: customRegistry, children });
+
+    const { result: customHook } = renderHook(
+      () =>
+        useCircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          instanceKey: "cust-key",
+        }),
+      { wrapper: wrapperCustom },
+    );
+    expect(customHook.current.state).toBe("CLOSED");
+    expect(customRegistry.get("cust-key")).toBeDefined();
+    expect(customRegistry.release("cust-key")).toBe(true);
   });
 
   it("should reject invalid instanceKey values", () => {

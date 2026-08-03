@@ -23,7 +23,13 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "lcov"],
       include: ["src/**/*.{ts,tsx}"],
-      exclude: ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.bench.ts"],
+      exclude: [
+        "src/**/*.test.ts",
+        "src/**/*.test.tsx",
+        "src/**/*.bench.ts",
+        "src/index.ts",
+        "src/otel-entry.ts",
+      ],
       thresholds: {
         "src/core.ts": {
           statements: 90,

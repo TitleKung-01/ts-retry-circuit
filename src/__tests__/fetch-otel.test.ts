@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { CircuitBreaker, CircuitRegistry } from "../core.js";
-import { withCircuit, createCircuitFetch } from "../fetch.js";
+import {
+  withCircuit,
+  createCircuitFetch,
+  circuitFetchFromConfig,
+} from "../fetch.js";
 import { instrumentCircuitBreaker, tracedExecute } from "../otel.js";
 
 describe("fetch helpers", () => {
@@ -107,5 +111,54 @@ describe("otel helpers", () => {
     expect(result).toBe("ok");
     expect(span.end).toHaveBeenCalled();
     expect(span.setAttribute).toHaveBeenCalled();
+  });
+
+  it("tracedExecute handles errors and records span exceptions", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+      name: "traced-err",
+    });
+    const span = {
+      setAttribute: vi.fn(),
+      recordException: vi.fn(),
+      setStatus: vi.fn(),
+      end: vi.fn(),
+    };
+    const tracer = {
+      startActiveSpan: vi.fn(async (_name, fn) => fn(span)),
+    };
+
+    await expect(
+      tracedExecute(breaker, tracer, async () => {
+        throw new Error("traced fail");
+      }),
+    ).rejects.toThrow("traced fail");
+
+    expect(span.recordException).toHaveBeenCalled();
+    expect(span.setStatus).toHaveBeenCalledWith({
+      code: 2,
+      message: "Error: traced fail",
+    });
+    expect(span.end).toHaveBeenCalled();
+  });
+
+  it("circuitFetchFromConfig creates fetch helper from config", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+      }),
+    );
+
+    const circuitFetch = circuitFetchFromConfig({
+      name: "config-fetch",
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+    });
+
+    const res = await circuitFetch("https://example.com/test");
+    expect(res.ok).toBe(true);
   });
 });

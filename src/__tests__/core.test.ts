@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   CircuitBreaker,
+  CircuitRegistry,
   CircuitOpenError,
   CircuitTimeoutError,
   CircuitAbortedError,
@@ -388,5 +389,185 @@ describe("CircuitBreaker Core", () => {
     controller.abort();
     await assertion;
     expect(sawAbort).toBe(true);
+  });
+
+  it("should support rolling strategy and open when failure percentage threshold is met", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 10,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      strategy: "rolling",
+      volumeThreshold: 4,
+      errorThresholdPercentage: 50,
+      rollingWindowMs: 10000,
+      rollingBuckets: 5,
+    });
+
+    const successFn = vi.fn().mockResolvedValue("ok");
+    const failFn = vi.fn().mockRejectedValue(new Error("fail"));
+
+    // 2 successes, 1 failure -> 33% fail (volume 3 < volumeThreshold 4) -> stays CLOSED
+    await breaker.execute(successFn);
+    await breaker.execute(successFn);
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("CLOSED");
+
+    // 2nd failure -> 2 successes + 2 failures = 4 total, 50% fail -> trips OPEN
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
+  });
+
+  it("should enforce capacity bulkhead limits", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 5,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      capacity: 1,
+    });
+
+    let releaseFirst: () => void = () => {};
+    const firstPromise = breaker.execute(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () => resolve("done");
+        }),
+    );
+
+    expect(breaker.getStatus().activeRequests).toBe(1);
+
+    // Second execution should be rejected by capacity
+    await expect(breaker.execute(async () => "blocked")).rejects.toThrow(
+      /Capacity limit/,
+    );
+
+    releaseFirst();
+    await firstPromise;
+    expect(breaker.getStatus().activeRequests).toBe(0);
+  });
+
+  it("should throttle concurrent requests in HALF-OPEN state", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+
+    const failFn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
+
+    vi.advanceTimersByTime(1001);
+    expect(breaker.getStatus().state).toBe("HALF-OPEN");
+
+    let resolveProbe: () => void = () => {};
+    const probePromise = breaker.execute(
+      () =>
+        new Promise((resolve) => {
+          resolveProbe = () => resolve("ok");
+        }),
+    );
+
+    // Second request while probe is active in HALF-OPEN should be throttled
+    await expect(breaker.execute(async () => "concurrent")).rejects.toThrow(
+      /HALF-OPEN/,
+    );
+
+    resolveProbe();
+    await probePromise;
+  });
+
+  it("should manage breakers via CircuitRegistry and static helpers", () => {
+    const breaker1 = new CircuitBreaker({
+      name: "payment-service",
+      failureThreshold: 3,
+      cooldownPeriod: 1000,
+    });
+
+    expect(CircuitBreaker.get("payment-service")).toBe(breaker1);
+    expect(
+      CircuitRegistry.getOrCreate("payment-service", {
+        failureThreshold: 3,
+        cooldownPeriod: 1000,
+      }),
+    ).toBe(breaker1);
+
+    const created = CircuitRegistry.getOrCreate("user-service", {
+      failureThreshold: 2,
+      cooldownPeriod: 500,
+    });
+    expect(created.getStatus().name).toBe("user-service");
+
+    expect(CircuitBreaker.release("user-service")).toBe(true);
+    expect(() => CircuitBreaker.get("user-service")).toThrow(/not registered/);
+
+    CircuitBreaker.release("payment-service");
+  });
+
+  it("should support lifecycle event registration and removal", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+
+    const openHandler = vi.fn();
+    const closeHandler = vi.fn();
+    const offOpen = breaker.on("open", openHandler);
+    const offClose = breaker.on("close", closeHandler);
+
+    await expect(
+      breaker.execute(async () => {
+        throw new Error("fail");
+      }),
+    ).rejects.toThrow("fail");
+    expect(openHandler).toHaveBeenCalledTimes(1);
+
+    breaker.reset();
+    expect(closeHandler).toHaveBeenCalledTimes(1);
+
+    offOpen();
+    offClose();
+  });
+
+  it("should validate all invalid configuration bounds", () => {
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          strategy: "rolling",
+          errorThresholdPercentage: 150,
+        }),
+    ).toThrow(/errorThresholdPercentage/);
+
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          strategy: "rolling",
+          volumeThreshold: 0,
+        }),
+    ).toThrow(/volumeThreshold/);
+
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          strategy: "rolling",
+          rollingWindowMs: 0,
+        }),
+    ).toThrow(/rollingWindowMs/);
+
+    expect(
+      () =>
+        new CircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          strategy: "rolling",
+          rollingBuckets: 0,
+        }),
+    ).toThrow(/rollingBuckets/);
   });
 });
