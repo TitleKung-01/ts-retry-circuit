@@ -54,6 +54,15 @@ Out of scope:
 
 Publish surface remains `files: ["dist"]` with zero runtime dependencies. Prefer lockfiles and `npm audit` in consuming apps.
 
+## Supply Chain Security
+
+`ts-retry-circuit` implements strict supply chain controls:
+
+1. **Zero Runtime Dependencies**: Package has `"dependencies": {}` preventing transitive dependency injection attacks.
+2. **SLSA Build Provenance**: NPM releases are built and signed using cryptographic build attestations (`npm publish --provenance`) on GitHub Actions via OIDC.
+3. **Least-Privilege CI Tokens**: GitHub Workflows enforce scoped permissions (`contents: read`, `security-events: write`).
+4. **Automated Security Auditing**: Repository is analyzed by CodeQL SAST, OpenSSF Scorecard, and Dependabot.
+
 ## Safe usage notes
 
 - Pass the attempt signal into I/O: `execute(({ signal }) => fetch(url, { signal }))`
