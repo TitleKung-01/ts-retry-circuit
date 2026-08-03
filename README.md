@@ -55,11 +55,13 @@ const breaker = new CircuitBreaker({
   },
 });
 
-const data = await breaker.execute(async (signal) => {
-  const res = await fetch("https://api.example.com/user", { signal });
-  if (!res.ok) throw new Error("upstream error");
-  return res.json();
-});
+async function fetchUserData() {
+  return breaker.execute(async () => {
+    const response = await fetch("https://api.example.com/user");
+    if (!response.ok) throw new Error("Internal Server Error");
+    return response.json();
+  });
+}
 ```
 
 ### Rolling window strategy
@@ -97,41 +99,37 @@ function CheckoutButton() {
   });
 
   return (
-    <button
-      disabled={isOpened}
-      onClick={() => execute(async (signal) => processPayment(signal))}
-    >
-      Pay ({state}, fails={metrics.failureCount})
-    </button>
+    <div>
+      <p>System State: <strong>{state}</strong></p>
+      <p>Consecutive Failures: {failureCount}</p>
+
+      <button
+        onClick={handleCheckout}
+        disabled={isOpened || isHalfOpen || activeRequests > 0}
+      >
+        {activeRequests > 0
+          ? "Processing..."
+          : isOpened
+            ? "Service Temporarily Unavailable"
+            : "Pay Now"}
+      </button>
+
+      {isOpened ? (
+        <button type="button" onClick={reset}>
+          Reset circuit
+        </button>
+      ) : null}
+    </div>
   );
 }
 ```
 
-**SSR:** Create a **new** `CircuitProvider` registry per request. Do not share mutable breakers across RSC requests. Module-level `instanceKey` registry is fine for client-only / long-lived Node processes.
+### 3. Sharing Circuit State Across Components
 
-### Fetch helper
+Config is frozen at the first registration for a given `instanceKey`. Later mounts reuse that instance and ignore new config. Call `releaseInstance(key)` for tests or SPA teardown.
 
-```typescript
-import { CircuitBreaker, createCircuitFetch } from "ts-retry-circuit";
-
-const breaker = new CircuitBreaker({
-  failureThreshold: 5,
-  cooldownPeriod: 10_000,
-  timeout: 3000,
-  maxRetries: 1,
-});
-const circuitFetch = createCircuitFetch(breaker);
-
-const res = await circuitFetch("https://api.example.com/items", {
-  expectedStatuses: [404],
-});
-```
-
-### OpenTelemetry
-
-```typescript
-import { CircuitBreaker } from "ts-retry-circuit";
-import { instrumentCircuitBreaker } from "ts-retry-circuit/otel";
+```tsx
+import { useCircuitBreaker, releaseInstance } from "ts-retry-circuit/react";
 
 const breaker = new CircuitBreaker({
   name: "inventory",
@@ -173,18 +171,24 @@ More recipes: [docs/COOKBOOK.md](./docs/COOKBOOK.md) · Versioning: [SEMVER.md](
 
 ### `CircuitConfig` (new / notable)
 
-| Property | Default | Description |
-| :--- | :--- | :--- |
-| `strategy` | `"consecutive"` | `"rolling"` uses error % window |
-| `capacity` | unlimited | Max concurrent `execute` calls |
-| `name` | — | Registers in `CircuitRegistry` |
-| `errorThresholdPercentage` | `50` | Rolling only |
-| `volumeThreshold` | `5` | Rolling only |
-| `rollingWindowMs` / `rollingBuckets` | `10000` / `10` | Rolling window |
+| Property | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `failureThreshold` | `number` | **Required** | Consecutive failures to open the circuit. |
+| `cooldownPeriod` | `number` | **Required** | Ms to stay `OPEN` before `HALF-OPEN`. |
+| `maxRetries` | `number` | `3` | Retries while `CLOSED`. |
+| `initialRetryDelay` | `number` | `500` | Initial backoff delay (ms). |
+| `timeout` | `number` | `undefined` | Per-attempt timeout (ms). |
+| `halfOpenSuccessThreshold` | `number` | `1` | Successes in `HALF-OPEN` before `CLOSED`. |
+| `isExpectedError` | `(err) => boolean` | `undefined` | Errors that do not count as failures. |
+| `fallback` | `(err, ctx) => unknown` | `undefined` | Used on OPEN/throttle/final failure (not expected errors). |
 
-### Events
+### `CircuitBreaker`
 
-`open` · `close` · `halfOpen` · `success` · `failure` · `reject` · `timeout` · `fallback` · `retry`
+- `execute<T>(fn, options?: { signal?: AbortSignal }): Promise<T>`
+- `getStatus(): CircuitStatus`
+- `getMetrics(): CircuitMetrics`
+- `reset(): void`
+- `subscribe(listener): () => void`
 
 ### Typed errors
 
@@ -201,6 +205,14 @@ npm run test:coverage
 npm run build
 npm run bench
 ```
+
+---
+
+## Further reading
+
+- [Cookbook](docs/COOKBOOK.md) — fetch, Next.js, React, fallback, metrics patterns
+- [Versioning (SemVer)](SEMVER.md) — what counts as major / minor / patch
+- [Security](SECURITY.md) — supported versions and vulnerability reporting
 
 ---
 

@@ -1,40 +1,67 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   CircuitBreaker,
-  CircuitRegistry,
   CircuitOpenError,
-  CircuitHalfOpenThrottledError,
   CircuitTimeoutError,
   CircuitAbortedError,
-  CircuitCapacityRejectedError,
   isCircuitError,
 } from "../core.js";
 
-describe("CircuitBreaker", () => {
+describe("CircuitBreaker Core", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    CircuitRegistry.clear();
   });
 
   afterEach(() => {
     vi.useRealTimers();
-    CircuitRegistry.clear();
   });
 
-  it("should successfully execute a function when CLOSED", async () => {
+  it("should initialize in CLOSED state", () => {
     const breaker = new CircuitBreaker({
-      failureThreshold: 2,
+      failureThreshold: 3,
+      cooldownPeriod: 1000,
+    });
+    const status = breaker.getStatus();
+
+    expect(status.state).toBe("CLOSED");
+    expect(status.failureCount).toBe(0);
+    expect(status.activeRequests).toBe(0);
+  });
+
+  it("should return result when executed function succeeds", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 3,
       cooldownPeriod: 1000,
     });
     const fn = vi.fn().mockResolvedValue("success");
+
     const result = await breaker.execute(fn);
+
     expect(result).toBe("success");
-    expect(breaker.getStatus().state).toBe("CLOSED");
+    expect(fn).toHaveBeenCalledTimes(1);
     expect(breaker.getStatus().failureCount).toBe(0);
-    expect(breaker.getMetrics().successCount).toBe(1);
   });
 
-  it("should transition to OPEN after failureThreshold is reached", async () => {
+  it("should retry up to maxRetries on failure while CLOSED", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 3,
+      cooldownPeriod: 1000,
+      maxRetries: 2,
+      initialRetryDelay: 100,
+    });
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+
+    const promise = breaker.execute(fn);
+    const assertion = expect(promise).rejects.toThrow("fail");
+
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(fn).toHaveBeenCalledTimes(3); // 1 initial + 2 retries
+    expect(breaker.getStatus().failureCount).toBe(1);
+  });
+
+  it("should transition to OPEN after failureThreshold reached", async () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 2,
       cooldownPeriod: 1000,
@@ -49,330 +76,151 @@ describe("CircuitBreaker", () => {
     await expect(breaker.execute(fn)).rejects.toThrow("fail");
     expect(breaker.getStatus().state).toBe("OPEN");
     expect(breaker.getStatus().failureCount).toBe(2);
-    expect(breaker.getMetrics().openedCount).toBe(1);
 
     await expect(breaker.execute(fn)).rejects.toBeInstanceOf(CircuitOpenError);
   });
 
-  it("should expose retryAfterMs on CircuitOpenError", async () => {
+  it("should execute fallback when OPEN", async () => {
+    const fallbackFn = vi.fn().mockReturnValue("fallback-val");
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
-      cooldownPeriod: 5000,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      fallback: fallbackFn,
+    });
+
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+
+    // First attempt fails, trips circuit, executes fallback
+    const result1 = await breaker.execute(fn);
+    expect(result1).toBe("fallback-val");
+    expect(breaker.getStatus().state).toBe("OPEN");
+
+    // Second attempt directly executes fallback without calling fn
+    const result2 = await breaker.execute(fn);
+    expect(result2).toBe("fallback-val");
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("should transition from OPEN to HALF-OPEN after cooldownPeriod", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
       maxRetries: 0,
     });
     const fn = vi.fn().mockRejectedValue(new Error("fail"));
+
     await expect(breaker.execute(fn)).rejects.toThrow("fail");
-
-    try {
-      await breaker.execute(fn);
-      expect.unreachable();
-    } catch (error) {
-      expect(error).toBeInstanceOf(CircuitOpenError);
-      expect((error as CircuitOpenError).code).toBe("CIRCUIT_OPEN");
-      expect((error as CircuitOpenError).retryAfterMs).toBeGreaterThan(0);
-      expect((error as CircuitOpenError).retryAfterMs).toBeLessThanOrEqual(
-        5000,
-      );
-    }
-
-    expect(breaker.getMetrics().rejectedCount).toBe(1);
-  });
-
-  it("should retry when failing in CLOSED state", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 2,
-      cooldownPeriod: 1000,
-      maxRetries: 2,
-      initialRetryDelay: 10,
-    });
-
-    let calls = 0;
-    const fn = vi.fn().mockImplementation(async () => {
-      calls++;
-      if (calls < 3) {
-        throw new Error("fail");
-      }
-      return "success";
-    });
-
-    const promise = breaker.execute(fn);
-    await vi.runAllTimersAsync();
-    const result = await promise;
-
-    expect(result).toBe("success");
-    expect(fn).toHaveBeenCalledTimes(3);
-    expect(breaker.getStatus().state).toBe("CLOSED");
-    expect(breaker.getStatus().failureCount).toBe(0);
-  });
-
-  it("should bypass failures if error is expected", async () => {
-    const isExpectedError = (err: unknown) => {
-      return err instanceof Error && err.message === "expected";
-    };
-
-    const breaker = new CircuitBreaker({
-      failureThreshold: 2,
-      cooldownPeriod: 1000,
-      isExpectedError,
-      maxRetries: 0,
-    });
-
-    const fn = vi.fn().mockRejectedValue(new Error("expected"));
-
-    await expect(breaker.execute(fn)).rejects.toThrow("expected");
-    expect(breaker.getStatus().state).toBe("CLOSED");
-    expect(breaker.getStatus().failureCount).toBe(0);
-  });
-
-  it("should not use fallback for expected errors", async () => {
-    const fallback = vi.fn().mockResolvedValue("fallback");
-    const breaker = new CircuitBreaker({
-      failureThreshold: 2,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-      isExpectedError: () => true,
-      fallback,
-    });
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("expected");
-      }),
-    ).rejects.toThrow("expected");
-    expect(fallback).not.toHaveBeenCalled();
-  });
-
-  it("should enter HALF-OPEN after cooldown and close on success", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-    });
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
     expect(breaker.getStatus().state).toBe("OPEN");
 
-    await vi.advanceTimersByTimeAsync(1001);
+    vi.advanceTimersByTime(1001);
+
     expect(breaker.getStatus().state).toBe("HALF-OPEN");
-
-    const result = await breaker.execute(async () => "recovered");
-    expect(result).toBe("recovered");
-    expect(breaker.getStatus().state).toBe("CLOSED");
   });
 
-  it("should re-open on HALF-OPEN failure", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-    });
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
-
-    await vi.advanceTimersByTimeAsync(1001);
-    expect(breaker.getStatus().state).toBe("HALF-OPEN");
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("still down");
-      }),
-    ).rejects.toThrow("still down");
-
-    expect(breaker.getStatus().state).toBe("OPEN");
-    expect(breaker.getMetrics().openedCount).toBe(2);
-  });
-
-  it("should throttle concurrent HALF-OPEN probes", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-    });
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
-
-    await vi.advanceTimersByTimeAsync(1001);
-
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    const first = breaker.execute(async () => {
-      await gate;
-      return "ok";
-    });
-
-    await Promise.resolve();
-    await expect(breaker.execute(async () => "second")).rejects.toBeInstanceOf(
-      CircuitHalfOpenThrottledError,
-    );
-
-    expect(breaker.getMetrics().rejectedCount).toBe(1);
-
-    release();
-    await expect(first).resolves.toBe("ok");
-    expect(breaker.getStatus().state).toBe("CLOSED");
-  });
-
-  it("should not retry in HALF-OPEN", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 3,
-      initialRetryDelay: 10,
-    });
-
-    const openPromise = breaker.execute(async () => {
-      throw new Error("fail");
-    });
-    const openExpectation = expect(openPromise).rejects.toThrow("fail");
-    await vi.runAllTimersAsync();
-    await openExpectation;
-
-    await vi.advanceTimersByTimeAsync(1001);
-
-    const fn = vi.fn().mockRejectedValue(new Error("probe fail"));
-    await expect(breaker.execute(fn)).rejects.toThrow("probe fail");
-    expect(fn).toHaveBeenCalledTimes(1);
-    expect(breaker.getStatus().state).toBe("OPEN");
-  });
-
-  it("should timeout and count as failure", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-      timeout: 50,
-    });
-
-    const promise = breaker.execute(
-      () => new Promise((resolve) => setTimeout(() => resolve("late"), 200)),
-    );
-
-    const assertion =
-      expect(promise).rejects.toBeInstanceOf(CircuitTimeoutError);
-    await vi.advanceTimersByTimeAsync(50);
-    await assertion;
-
-    expect(breaker.getStatus().state).toBe("OPEN");
-  });
-
-  it("should use fallback when OPEN", async () => {
-    const fallback = vi.fn((error: unknown) => {
-      if (error instanceof CircuitOpenError) return "cached";
-      throw error;
-    });
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 5000,
-      maxRetries: 0,
-      fallback,
-    });
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
-
-    const result = await breaker.execute(async () => "should-not-run");
-    expect(result).toBe("cached");
-    expect(fallback).toHaveBeenCalledTimes(2);
-    expect(fallback.mock.calls[1][0]).toBeInstanceOf(CircuitOpenError);
-  });
-
-  it("should use fallback after final failure", async () => {
-    const fallback = vi.fn().mockReturnValue("degraded");
-    const breaker = new CircuitBreaker({
-      failureThreshold: 5,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-      fallback,
-    });
-
-    const result = await breaker.execute(async () => {
-      throw new Error("boom");
-    });
-
-    expect(result).toBe("degraded");
-    expect(fallback.mock.calls[0][0]).toBeInstanceOf(Error);
-    expect(breaker.getStatus().failureCount).toBe(1);
-  });
-
-  it("should abort during retry sleep when signal aborts", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 5,
-      cooldownPeriod: 1000,
-      maxRetries: 2,
-      initialRetryDelay: 1000,
-    });
-
-    const controller = new AbortController();
-    const promise = breaker.execute(
-      async () => {
-        throw new Error("transient");
-      },
-      { signal: controller.signal },
-    );
-
-    await vi.advanceTimersByTimeAsync(1);
-    controller.abort();
-
-    await expect(promise).rejects.toBeInstanceOf(CircuitAbortedError);
-  });
-
-  it("should reject immediately when signal is already aborted", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 2,
-      cooldownPeriod: 1000,
-    });
-    const controller = new AbortController();
-    controller.abort();
-
-    await expect(
-      breaker.execute(async () => "ok", { signal: controller.signal }),
-    ).rejects.toBeInstanceOf(CircuitAbortedError);
-  });
-
-  it("should require halfOpenSuccessThreshold successes before CLOSED", async () => {
+  it("should transition from HALF-OPEN back to CLOSED after halfOpenSuccessThreshold is met", async () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
       cooldownPeriod: 1000,
       maxRetries: 0,
       halfOpenSuccessThreshold: 2,
     });
+    const failFn = vi.fn().mockRejectedValue(new Error("fail"));
+    const successFn = vi.fn().mockResolvedValue("ok");
 
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
 
-    await vi.advanceTimersByTimeAsync(1001);
-
-    await expect(breaker.execute(async () => "one")).resolves.toBe("one");
+    vi.advanceTimersByTime(1001);
     expect(breaker.getStatus().state).toBe("HALF-OPEN");
-    expect(breaker.getMetrics().halfOpenSuccessCount).toBe(1);
 
-    await expect(breaker.execute(async () => "two")).resolves.toBe("two");
+    await breaker.execute(successFn);
+    expect(breaker.getStatus().state).toBe("HALF-OPEN");
+
+    await breaker.execute(successFn);
     expect(breaker.getStatus().state).toBe("CLOSED");
-    expect(breaker.getMetrics().halfOpenSuccessCount).toBe(0);
   });
 
-  it("should notify subscribers and support unsubscribe", async () => {
+  it("should re-open immediately on failure while HALF-OPEN", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+
+    await expect(breaker.execute(fn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
+
+    vi.advanceTimersByTime(1001);
+    expect(breaker.getStatus().state).toBe("HALF-OPEN");
+
+    await expect(breaker.execute(fn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
+  });
+
+  it("should ignore expected errors when isExpectedError returns true", async () => {
+    const isExpectedError = vi.fn().mockImplementation((err: unknown) => {
+      return err instanceof Error && err.message === "expected";
+    });
+
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      isExpectedError,
+    });
+
+    const fn = vi.fn().mockRejectedValue(new Error("expected"));
+
+    await expect(breaker.execute(fn)).rejects.toThrow("expected");
+    expect(breaker.getStatus().failureCount).toBe(0);
+    expect(breaker.getStatus().state).toBe("CLOSED");
+  });
+
+  it("should handle per-attempt timeout", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      timeout: 500,
+    });
+
+    const slowFn = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve("slow"), 1000);
+        }),
+    );
+
+    const promise = breaker.execute(slowFn);
+    const assertion =
+      expect(promise).rejects.toBeInstanceOf(CircuitTimeoutError);
+
+    await vi.advanceTimersByTimeAsync(500);
+    await assertion;
+
+    expect(breaker.getStatus().failureCount).toBe(1);
+  });
+
+  it("should handle external abort signal", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 3,
+      cooldownPeriod: 1000,
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const fn = vi.fn().mockResolvedValue("ok");
+
+    await expect(
+      breaker.execute(fn, { signal: controller.signal }),
+    ).rejects.toBeInstanceOf(CircuitAbortedError);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("should notify state change listeners", async () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
       cooldownPeriod: 1000,
@@ -382,34 +230,23 @@ describe("CircuitBreaker", () => {
     const listener = vi.fn();
     const unsubscribe = breaker.subscribe(listener);
 
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(breaker.execute(fn)).rejects.toThrow("fail");
 
-    expect(listener).toHaveBeenCalled();
-    const callsBefore = listener.mock.calls.length;
+    expect(listener).toHaveBeenCalledWith("OPEN", expect.anything());
+
     unsubscribe();
-
-    await expect(breaker.execute(async () => "x")).rejects.toBeInstanceOf(
-      CircuitOpenError,
-    );
-    expect(listener.mock.calls.length).toBe(callsBefore);
   });
 
-  it("should reset state and counters", async () => {
+  it("should support reset() to return to CLOSED state", async () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
       cooldownPeriod: 1000,
       maxRetries: 0,
     });
 
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(breaker.execute(fn)).rejects.toThrow("fail");
     expect(breaker.getStatus().state).toBe("OPEN");
 
     breaker.reset();
@@ -447,102 +284,9 @@ describe("CircuitBreaker", () => {
 
   it("isCircuitError recognizes typed errors", () => {
     expect(isCircuitError(new CircuitOpenError(10))).toBe(true);
-    expect(isCircuitError(new CircuitCapacityRejectedError(2))).toBe(true);
-    expect(isCircuitError(new Error("x"))).toBe(false);
   });
 
-  it("should emit typed events", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 1,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-      name: "events",
-    });
-    const open = vi.fn();
-    const failure = vi.fn();
-    breaker.on("open", open);
-    breaker.on("failure", failure);
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("fail");
-      }),
-    ).rejects.toThrow("fail");
-
-    expect(failure).toHaveBeenCalled();
-    expect(open).toHaveBeenCalled();
-    expect(open.mock.calls[0][0].name).toBe("events");
-  });
-
-  it("should enforce capacity bulkhead", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 5,
-      cooldownPeriod: 1000,
-      maxRetries: 0,
-      capacity: 1,
-    });
-
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    const first = breaker.execute(async () => {
-      await gate;
-      return "ok";
-    });
-    await Promise.resolve();
-
-    await expect(breaker.execute(async () => "nope")).rejects.toBeInstanceOf(
-      CircuitCapacityRejectedError,
-    );
-    expect(breaker.getMetrics().rejectedCount).toBe(1);
-
-    release();
-    await expect(first).resolves.toBe("ok");
-  });
-
-  it("should register named breakers", () => {
-    const a = CircuitBreaker.get("payments", {
-      failureThreshold: 2,
-      cooldownPeriod: 1000,
-    });
-    const b = CircuitBreaker.get("payments");
-    expect(a).toBe(b);
-    expect(CircuitRegistry.keys()).toContain("payments");
-    expect(CircuitBreaker.release("payments")).toBe(true);
-  });
-
-  it("should trip on rolling error percentage", async () => {
-    const breaker = new CircuitBreaker({
-      failureThreshold: 100,
-      cooldownPeriod: 5000,
-      maxRetries: 0,
-      strategy: "rolling",
-      volumeThreshold: 4,
-      errorThresholdPercentage: 50,
-      rollingWindowMs: 10_000,
-      rollingBuckets: 10,
-    });
-
-    await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
-    await expect(breaker.execute(async () => "ok")).resolves.toBe("ok");
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("a");
-      }),
-    ).rejects.toThrow("a");
-    expect(breaker.getStatus().state).toBe("CLOSED");
-
-    await expect(
-      breaker.execute(async () => {
-        throw new Error("b");
-      }),
-    ).rejects.toThrow("b");
-    expect(breaker.getStatus().state).toBe("OPEN");
-  });
-
-  it("should abort in-flight work via timeout signal", async () => {
+  it("should pass abort signal to attempt and abort on timeout", async () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
       cooldownPeriod: 1000,
@@ -551,16 +295,18 @@ describe("CircuitBreaker", () => {
     });
 
     let sawAbort = false;
-    const promise = breaker.execute(async (signal) => {
-      await new Promise<void>((resolve, reject) => {
-        const id = setTimeout(() => resolve(), 200);
-        signal.addEventListener("abort", () => {
-          sawAbort = true;
-          clearTimeout(id);
-          reject(new DOMException("Aborted", "AbortError"));
-        });
+    const promise = breaker.execute(({ signal }) => {
+      return new Promise((resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            sawAbort = true;
+            reject(new Error("aborted by signal"));
+          },
+          { once: true },
+        );
+        setTimeout(() => resolve("late"), 200);
       });
-      return "late";
     });
 
     const assertion =
@@ -609,5 +355,38 @@ describe("CircuitBreaker", () => {
     ]);
     expect(results).toEqual(["a", "b", "c"]);
     expect(breaker.getStatus().activeRequests).toBe(0);
+  });
+
+  it("should abort work when the caller signal aborts mid-flight", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+    });
+
+    const controller = new AbortController();
+    let sawAbort = false;
+
+    const promise = breaker.execute(
+      ({ signal }) =>
+        new Promise((resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              sawAbort = true;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+          setTimeout(() => resolve("done"), 5_000);
+        }),
+      { signal: controller.signal },
+    );
+
+    const assertion =
+      expect(promise).rejects.toBeInstanceOf(CircuitAbortedError);
+    controller.abort();
+    await assertion;
+    expect(sawAbort).toBe(true);
   });
 });

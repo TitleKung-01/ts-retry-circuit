@@ -15,8 +15,25 @@ import {
   CircuitConfig,
   CircuitMetrics,
   CircuitState,
+  ExecuteContext,
   ExecuteOptions,
+  ExecuteWork,
 } from "./core.js";
+
+const INSTANCE_KEY_PATTERN = /^[a-zA-Z0-9:_./-]+$/;
+const INSTANCE_KEY_MAX_LENGTH = 128;
+
+export function assertInstanceKey(instanceKey: string): void {
+  if (
+    instanceKey.length === 0 ||
+    instanceKey.length > INSTANCE_KEY_MAX_LENGTH ||
+    !INSTANCE_KEY_PATTERN.test(instanceKey)
+  ) {
+    throw new Error(
+      `instanceKey must be 1..${INSTANCE_KEY_MAX_LENGTH} chars matching ${INSTANCE_KEY_PATTERN}`,
+    );
+  }
+}
 
 export interface UseCircuitBreakerOptions extends CircuitConfig {
   /**
@@ -24,6 +41,8 @@ export interface UseCircuitBreakerOptions extends CircuitConfig {
    * Config is frozen at the first registration for a given key;
    * later mounts with the same key reuse that instance and ignore new config.
    *
+   * Use a stable dependency name (e.g. `"payments"`). Do not derive keys from
+   * end-user ids.
    * Prefer CircuitProvider for SSR-safe scoping instead of the module registry.
    */
   instanceKey?: string;
@@ -36,7 +55,7 @@ export interface UseCircuitBreakerResult {
   nextAttemptTime: number;
   metrics: CircuitMetrics;
   execute: <T>(
-    fn: (signal: AbortSignal) => Promise<T>,
+    fn: (ctx: ExecuteContext & AbortSignal) => Promise<T>,
     options?: ExecuteOptions,
   ) => Promise<T>;
   reset: () => void;
@@ -45,64 +64,106 @@ export interface UseCircuitBreakerResult {
   breaker: CircuitBreaker;
 }
 
-const fallbackRegistry = new Map<string, CircuitBreaker>();
+type RegistryEntry = {
+  breaker: CircuitBreaker;
+  refCount: number;
+};
+
+const breakerRegistry = new Map<string, RegistryEntry>();
+
+function ensureSharedBreaker(
+  instanceKey: string,
+  config: CircuitConfig,
+): CircuitBreaker {
+  assertInstanceKey(instanceKey);
+
+  const existing = breakerRegistry.get(instanceKey);
+  if (existing) {
+    return existing.breaker;
+  }
+
+  const breaker = new CircuitBreaker(config);
+  breakerRegistry.set(instanceKey, { breaker, refCount: 0 });
+  return breaker;
+}
+
+function retainSharedBreaker(
+  instanceKey: string,
+  breaker: CircuitBreaker,
+): void {
+  const existing = breakerRegistry.get(instanceKey);
+  if (existing) {
+    existing.refCount++;
+    return;
+  }
+  breakerRegistry.set(instanceKey, { breaker, refCount: 1 });
+}
+
+function releaseSharedBreaker(instanceKey: string): void {
+  const existing = breakerRegistry.get(instanceKey);
+  if (!existing) return;
+
+  existing.refCount--;
+  if (existing.refCount <= 0) {
+    breakerRegistry.delete(instanceKey);
+  }
+}
 
 /** Remove a shared instance from the module registry (tests / SPA teardown). */
 export function releaseInstance(instanceKey: string): boolean {
-  return fallbackRegistry.delete(instanceKey);
+  return breakerRegistry.delete(instanceKey);
 }
 
-interface CircuitContextValue {
-  registry: Map<string, CircuitBreaker>;
-  getOrCreate: (key: string, config: CircuitConfig) => CircuitBreaker;
-  release: (key: string) => boolean;
+export interface CircuitRegistryLike {
+  get(name: string): CircuitBreaker | undefined;
+  getOrCreate(name: string, config: CircuitConfig): CircuitBreaker;
+  release?(name: string): boolean;
 }
 
-const CircuitContext = createContext<CircuitContextValue | null>(null);
+export const CircuitContext = createContext<CircuitRegistryLike | null>(null);
 
 export interface CircuitProviderProps {
+  registry?: Map<string, CircuitBreaker> | CircuitRegistryLike;
   children: ReactNode;
-  /**
-   * Optional initial registry. Defaults to a fresh Map scoped to this provider
-   * (safe for per-request SSR trees).
-   */
-  registry?: Map<string, CircuitBreaker>;
 }
 
-/**
- * Scopes shared circuit instances to a React tree.
- * Use one provider per SSR request / app root — do not reuse the Map across requests.
- */
-export function CircuitProvider({ children, registry }: CircuitProviderProps) {
-  const mapRef = useRef(registry ?? new Map<string, CircuitBreaker>());
-
-  const value = useMemo<CircuitContextValue>(
-    () => ({
-      registry: mapRef.current,
-      getOrCreate(key, config) {
-        const existing = mapRef.current.get(key);
-        if (existing) return existing;
-        const breaker = new CircuitBreaker(config);
-        mapRef.current.set(key, breaker);
-        return breaker;
+export function CircuitProvider({ registry, children }: CircuitProviderProps) {
+  const adapter = useMemo<CircuitRegistryLike>(() => {
+    if (!registry) {
+      const map = new Map<string, CircuitBreaker>();
+      return {
+        get: (name) => map.get(name),
+        getOrCreate: (name, config) => {
+          let b = map.get(name);
+          if (!b) {
+            b = new CircuitBreaker({ ...config, name });
+            map.set(name, b);
+          }
+          return b;
+        },
+        release: (name) => map.delete(name),
+      };
+    }
+    if ("getOrCreate" in registry) return registry;
+    return {
+      get: (name) => registry.get(name),
+      getOrCreate: (name, config) => {
+        let b = (registry as Map<string, CircuitBreaker>).get(name);
+        if (!b) {
+          b = new CircuitBreaker({ ...config, name });
+          (registry as Map<string, CircuitBreaker>).set(name, b);
+        }
+        return b;
       },
-      release(key) {
-        return mapRef.current.delete(key);
-      },
-    }),
-    [],
-  );
+      release: (name) => (registry as Map<string, CircuitBreaker>).delete(name),
+    };
+  }, [registry]);
 
-  return createElement(CircuitContext.Provider, { value }, children);
-}
-
-export function useCircuitRegistry(): CircuitContextValue | null {
-  return useContext(CircuitContext);
+  return createElement(CircuitContext.Provider, { value: adapter, children });
 }
 
 function createConfig(options: UseCircuitBreakerOptions): CircuitConfig {
   const {
-    instanceKey: _key,
     failureThreshold,
     cooldownPeriod,
     maxRetries,
@@ -160,10 +221,7 @@ export function useCircuitBreaker(
       if (ctx) {
         breakerRef.current = ctx.getOrCreate(instanceKey, config);
       } else {
-        if (!fallbackRegistry.has(instanceKey)) {
-          fallbackRegistry.set(instanceKey, new CircuitBreaker(config));
-        }
-        breakerRef.current = fallbackRegistry.get(instanceKey)!;
+        breakerRef.current = ensureSharedBreaker(instanceKey, config);
       }
     } else {
       breakerRef.current = new CircuitBreaker(config);
@@ -173,6 +231,10 @@ export function useCircuitBreaker(
   useEffect(() => {
     const breaker = breakerRef.current;
     if (!breaker) return;
+
+    if (instanceKey && !ctx) {
+      retainSharedBreaker(instanceKey, breaker);
+    }
 
     const sync = () => {
       const status = breaker.getStatus();
@@ -192,12 +254,15 @@ export function useCircuitBreaker(
 
     return () => {
       unsubscribe();
+      if (instanceKey && !ctx) {
+        releaseSharedBreaker(instanceKey);
+      }
     };
-  }, [instanceKey]);
+  }, [instanceKey, ctx]);
 
   const execute = useCallback(
     async <T>(
-      fn: (signal: AbortSignal) => Promise<T>,
+      fn: (ctx: ExecuteContext & AbortSignal) => Promise<T>,
       execOptions?: ExecuteOptions,
     ): Promise<T> => {
       const breaker = breakerRef.current;

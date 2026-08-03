@@ -5,6 +5,7 @@ import {
   useCircuitBreaker,
   releaseInstance,
   CircuitProvider,
+  assertInstanceKey,
 } from "../react.js";
 
 describe("useCircuitBreaker", () => {
@@ -13,6 +14,7 @@ describe("useCircuitBreaker", () => {
     releaseInstance("release-key");
     releaseInstance("reuse-key");
     releaseInstance("provider-key");
+    releaseInstance("fresh-key");
   });
 
   it("should initialize hook with correct default values", () => {
@@ -161,13 +163,13 @@ describe("useCircuitBreaker", () => {
     unmount();
   });
 
-  it("should reuse registry instance for the same key after remount", async () => {
+  it("should drop registry entry after last subscriber unmounts", async () => {
     const first = renderHook(() =>
       useCircuitBreaker({
         failureThreshold: 1,
         cooldownPeriod: 5000,
         maxRetries: 0,
-        instanceKey: "reuse-key",
+        instanceKey: "fresh-key",
       }),
     );
 
@@ -184,15 +186,15 @@ describe("useCircuitBreaker", () => {
 
     const second = renderHook(() =>
       useCircuitBreaker({
-        failureThreshold: 99,
-        cooldownPeriod: 1,
+        failureThreshold: 1,
+        cooldownPeriod: 5000,
         maxRetries: 0,
-        instanceKey: "reuse-key",
+        instanceKey: "fresh-key",
       }),
     );
 
-    expect(second.result.current.isOpened).toBe(true);
-    expect(second.result.current.state).toBe("OPEN");
+    expect(second.result.current.isOpened).toBe(false);
+    expect(second.result.current.state).toBe("CLOSED");
     second.unmount();
   });
 
@@ -223,5 +225,19 @@ describe("useCircuitBreaker", () => {
     expect(result.current.isOpened).toBe(true);
     expect(registry.has("provider-key")).toBe(true);
     expect(releaseInstance("provider-key")).toBe(false);
+  });
+
+  it("should reject invalid instanceKey values", () => {
+    expect(() => assertInstanceKey("")).toThrow(/instanceKey/);
+    expect(() => assertInstanceKey("bad key")).toThrow(/instanceKey/);
+    expect(() =>
+      renderHook(() =>
+        useCircuitBreaker({
+          failureThreshold: 1,
+          cooldownPeriod: 1000,
+          instanceKey: "user@id",
+        }),
+      ),
+    ).toThrow(/instanceKey/);
   });
 });

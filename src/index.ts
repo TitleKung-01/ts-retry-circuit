@@ -19,7 +19,9 @@ export type {
   CircuitState,
   CircuitStatus,
   CircuitTripStrategy,
+  ExecuteContext,
   ExecuteOptions,
+  ExecuteWork,
 } from "./core.js";
 
 export type { CircuitErrorCode } from "./errors.js";

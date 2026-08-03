@@ -1,26 +1,50 @@
-# Semantic Versioning Policy
+# Versioning (SemVer)
 
-This package follows [SemVer 2.0.0](https://semver.org/).
+`ts-retry-circuit` follows [Semantic Versioning 2.0.0](https://semver.org/).
 
-## What counts as a breaking change (MAJOR)
+Given a version `MAJOR.MINOR.PATCH`:
 
-- Removing or renaming a public export
-- Changing default behavior in a way that alters production outcomes for existing configs
-- Narrowing TypeScript types of public APIs
-- Raising the minimum supported Node.js major version
+| Change | Bump | Examples |
+| :--- | :--- | :--- |
+| Bug fix, docs, tests, internal refactors with no public API change | **PATCH** | Fix timeout cleanup; clarify README |
+| Backward-compatible API or behavior additions | **MINOR** | New optional config field; new exported helper |
+| Breaking public API or intentional behavior change | **MAJOR** | Rename/remove exports; change default semantics |
 
-## What counts as a feature (MINOR)
+## Public API surface
 
-- Additive config options with safe defaults
-- New optional exports / subpath entries
-- New events, metrics fields, or helpers that do not change existing defaults
+Breaking-change review applies to:
 
-## What counts as a fix (PATCH)
+- Package entry points: `ts-retry-circuit`, `ts-retry-circuit/react`
+- Exported classes, functions, types, and error `code` string literals
+- Documented defaults for `CircuitConfig` / hook options
+- Documented state machine behavior (`CLOSED` → `OPEN` → `HALF-OPEN`)
 
-- Bug fixes that restore documented behavior
-- Documentation, CI, and tooling-only changes
-- Performance improvements that preserve behavior
+Not part of the SemVer contract:
 
-## Deprecation
+- Private/`_`-prefixed members
+- Exact error `message` text (use `instanceof` or `.code`)
+- Undocumented internal counters or timing jitter randomness
+- Dev-only tooling (ESLint, Vitest, tsup config)
 
-Deprecated APIs are marked in JSDoc and listed in `CHANGELOG.md` for at least one MINOR release before removal in a MAJOR.
+## Compatibility promises
+
+- **TypeScript**: Public types are part of the contract for the supported TS versions listed in CI / peer ranges.
+- **React**: Optional peer; major React peer range expansions are usually **MINOR** unless the hook API breaks.
+- **Node / bundlers**: Dual ESM + CJS builds are maintained; dropping a format or Node engine floor is **MAJOR**.
+
+## Pre-releases
+
+Optional tags such as `2.1.0-beta.1` may be published for early feedback. Pre-releases are not guaranteed stable and may break without a major bump.
+
+## Release checklist
+
+1. Update `package.json` `version`
+2. Update `README.md` migration notes when releasing a **MAJOR**
+3. Run `npm run validate` and `npm run build`
+4. Commit, tag `vX.Y.Z`, push
+5. `npm publish --access public`
+
+## Historical note
+
+- **v1 → v2**: Typed circuit errors replaced emoji plain `Error` rejects; callers matching `error.message` must migrate to `instanceof` / `.code`. See README “Migrating from v1 to v2”.
+- **v2.1.0**: Security hardening MINOR — config bounds, attempt `AbortSignal`, HALF-OPEN probe flag, React registry ref-counting + `instanceKey` validation. Existing `execute(async () => …)` call sites remain valid; prefer `execute(({ signal }) => …)`.
