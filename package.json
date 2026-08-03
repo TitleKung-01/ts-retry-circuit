@@ -1,6 +1,6 @@
 {
   "name": "ts-retry-circuit",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "license": "MIT",
   "description": "A production-grade, isomorphic circuit breaker and auto-retry library for Node.js, Next.js, and React",
   "author": "TitleKung-01",
