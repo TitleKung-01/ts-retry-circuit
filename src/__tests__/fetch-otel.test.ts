@@ -67,16 +67,31 @@ describe("fetch helpers", () => {
     expect(res.status).toBe(404);
     expect(breaker.getStatus().state).toBe("CLOSED");
   });
+
+  it("createCircuitFetch merges userSignal if provided", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownPeriod: 1000,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const controller = new AbortController();
+    const circuitFetch = createCircuitFetch(breaker);
+    await circuitFetch("https://example.com", { signal: controller.signal });
+
+    expect(fetchMock).toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].signal).toBeDefined();
+  });
 });
 
 describe("otel helpers", () => {
-  it("instrumentCircuitBreaker records counters", async () => {
+  it("instrumentCircuitBreaker records counters and latency", async () => {
     const add = vi.fn();
     const record = vi.fn();
     const breaker = new CircuitBreaker({
       failureThreshold: 2,
       cooldownPeriod: 1000,
-      name: "otel-test",
     });
 
     const stop = instrumentCircuitBreaker(breaker, {
@@ -88,6 +103,21 @@ describe("otel helpers", () => {
 
     await breaker.execute(async () => "ok");
     expect(add).toHaveBeenCalled();
+    expect(record).toHaveBeenCalled();
+    stop();
+  });
+
+  it("instrumentCircuitBreaker works with default options and no meter", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownPeriod: 1000,
+    });
+    const stop = instrumentCircuitBreaker(breaker);
+    await expect(
+      breaker.execute(async () => {
+        throw new Error("fail");
+      }),
+    ).rejects.toThrow("fail");
     stop();
   });
 

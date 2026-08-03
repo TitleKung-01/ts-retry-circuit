@@ -3,6 +3,8 @@ import {
   CircuitBreaker,
   CircuitRegistry,
   CircuitOpenError,
+  CircuitHalfOpenThrottledError,
+  CircuitCapacityRejectedError,
   CircuitTimeoutError,
   CircuitAbortedError,
   isCircuitError,
@@ -285,6 +287,40 @@ describe("CircuitBreaker Core", () => {
 
   it("isCircuitError recognizes typed errors", () => {
     expect(isCircuitError(new CircuitOpenError(10))).toBe(true);
+    expect(isCircuitError(new CircuitHalfOpenThrottledError())).toBe(true);
+    expect(isCircuitError(new CircuitTimeoutError(500))).toBe(true);
+    expect(isCircuitError(new CircuitAbortedError())).toBe(true);
+    expect(isCircuitError(new CircuitCapacityRejectedError(5))).toBe(true);
+    expect(isCircuitError(new Error("generic"))).toBe(false);
+    expect(isCircuitError(null)).toBe(false);
+    expect(isCircuitError("not an error")).toBe(false);
+  });
+
+  it("should prune expired buckets in rolling strategy window", async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 10,
+      cooldownPeriod: 1000,
+      maxRetries: 0,
+      strategy: "rolling",
+      volumeThreshold: 2,
+      errorThresholdPercentage: 50,
+      rollingWindowMs: 5000,
+      rollingBuckets: 5,
+    });
+
+    const failFn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    await expect(breaker.execute(failFn)).rejects.toThrow("fail");
+    expect(breaker.getStatus().state).toBe("OPEN");
+
+    breaker.reset();
+    expect(breaker.getStatus().state).toBe("CLOSED");
+
+    // Advance past rolling window
+    vi.advanceTimersByTime(6000);
+    const successFn = vi.fn().mockResolvedValue("ok");
+    await breaker.execute(successFn);
+    expect(breaker.getStatus().state).toBe("CLOSED");
   });
 
   it("should pass abort signal to attempt and abort on timeout", async () => {
