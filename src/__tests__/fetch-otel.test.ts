@@ -111,6 +111,7 @@ describe("otel helpers", () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
       cooldownPeriod: 1000,
+      maxRetries: 0,
     });
     const stop = instrumentCircuitBreaker(breaker);
     await expect(
@@ -125,6 +126,7 @@ describe("otel helpers", () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 2,
       cooldownPeriod: 1000,
+      maxRetries: 0,
       name: "traced",
     });
     const span = {
@@ -147,6 +149,7 @@ describe("otel helpers", () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 2,
       cooldownPeriod: 1000,
+      maxRetries: 0,
       name: "traced-err",
     });
     const span = {
